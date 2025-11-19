@@ -1068,8 +1068,85 @@ print("\n" + "=" * 80)
 
 
 # %%
+# Define line styles for each cluster
+line_styles = {
+    81: '-',      # solid line for Bitcoin
+    500: '-',     # solid line for Tokenization
+    418: ':'      # dotted line for Digital Sangha (control)
+}
+
+# Update cluster names
+clusters_to_plot = {
+    81: 'Bitcoin Evolution Narrative',
+    500: 'Tokenization & Crypto Evolution',
+    418: 'Digital Sangha Narrative (control)'
+}
+
+# Plot tweet volume evolution for specific clusters
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
+
+# Define the clusters to plot
+clusters_to_plot = {
+    81: 'Bitcoin Evolution Narrative',
+    500: 'Tokenization & Crypto Evolution',
+    418: 'Digital Sangha Narrative (control)'
+}
+
+# Create figure
+plt.figure(figsize=(14, 7))
+
+# For each cluster, get tweet dates and plot
+for cluster_id, cluster_name in clusters_to_plot.items():
+    # Get cluster tweets
+    cluster_indices = X.index[X['cluster'] == cluster_id].tolist()
+    original_texts = []
+    for idx_val in cluster_indices:
+        try:
+            metadata = json.loads(df_all_with_clusters.iloc[idx_val]['metadata'])
+            original_text = metadata.get("original_text", "")
+            if original_text:
+                original_texts.append(original_text)
+        except:
+            continue
+    
+    # Get dates from enriched tweets
+    cluster_enriched = filtered_enriched_tweets[
+        filtered_enriched_tweets['full_text'].isin(original_texts)
+    ]
+    
+    if len(cluster_enriched) > 0:
+        dates = cluster_enriched['created_at'].sort_values()
+        
+        # Create monthly bins for smoother visualization
+        dates_series = pd.Series(dates.values)
+        monthly_counts = dates_series.groupby(dates_series.dt.to_period('M')).size()
+        monthly_dates = monthly_counts.index.to_timestamp()
+        
+        # Plot the line with the appropriate line style
+        plt.plot(monthly_dates, monthly_counts.values, label=f"{cluster_name}", 
+                linewidth=2, alpha=0.8, linestyle=line_styles[cluster_id])
+
+# Format the plot
+plt.xlabel('Date', fontsize=12)
+plt.ylabel('Tweet Volume (per month)', fontsize=12)
+plt.title('Tweet Volume Evolution', fontsize=14, fontweight='bold')
+plt.legend(loc='best', fontsize=10)
+plt.grid(True, alpha=0.3)
+
+# Format x-axis dates
+ax = plt.gca()
+ax.xaxis.set_major_formatter(mdates.DateFormatter('%Y'))
+ax.xaxis.set_major_locator(mdates.YearLocator(2))
+plt.xticks(rotation=45)
+
+plt.tight_layout()
+plt.savefig('cluster_volume_evolution.png', dpi=300, bbox_inches='tight')
+plt.show()
+
+print("\nPlot saved as 'cluster_volume_evolution.png'")
 
 
 
 
-
+# %%
