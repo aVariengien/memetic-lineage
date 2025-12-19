@@ -6,6 +6,7 @@ import { StrandDetail } from './StrandDetail';
 import { TweetPane } from '../TweetPane';
 import { VerticalSpine } from '../VerticalSpine';
 import { StrandUmap } from './StrandUmap';
+import { StrandHistogram } from './StrandHistogram';
 
 interface BestStrandsClientProps {
   strands: StrandWithTweet[];
@@ -224,11 +225,12 @@ export function BestStrandsClient({ strands }: BestStrandsClientProps) {
                 const summaryPreview = strand.rating.reasoning_summary.slice(0, 120) +
                   (strand.rating.reasoning_summary.length > 120 ? '...' : '');
 
-                return (
+                return [
+                  // Main data row
                   <tr
-                    key={strand.seed_tweet_id}
+                    key={`${strand.seed_tweet_id}-data`}
                     onClick={() => setSelectedStrand(strand)}
-                    className={`border-b border-gray-200 cursor-pointer transition-colors hover:bg-yellow-50 ${
+                    className={`border-b-0 cursor-pointer transition-colors hover:bg-yellow-50 ${
                       idx % 2 === 0 ? 'bg-white' : 'bg-gray-50'
                     }`}
                   >
@@ -282,9 +284,20 @@ export function BestStrandsClient({ strands }: BestStrandsClientProps) {
                         {strand.seeds?.length || 0}
                       </span>
                     </td>
+                  </tr>,
+                  // Histogram row spanning all columns
+                  <tr
+                    key={`${strand.seed_tweet_id}-histogram`}
+                    className={`border-b border-gray-200 ${
+                      idx % 2 === 0 ? 'bg-white' : 'bg-gray-50'
+                    }`}
+                  >
+                    <td colSpan={8} className="px-4 pb-3 pt-0">
+                      <StrandHistogram strandId={strand.seed_tweet_id} />
+                    </td>
                   </tr>
-                );
-              })}
+                ];
+              }).flat()}
             </tbody>
           </table>
         </div>
