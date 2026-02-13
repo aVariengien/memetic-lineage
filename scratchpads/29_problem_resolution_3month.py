@@ -1,18 +1,12 @@
 # %%
 """
-Bootstrap analysis for problem-resolution study.
-
-1. Build tweet-id subsets for last week of Aug 2024 and six months up to Sep 2024
-2. Sample 50 top-level tweets for manual labeling
-3. Find top 20 eligible users by tweet volume in the week subset
-4. Collect their top-level tweets
-5. Classify tweets as problem statements via DeepSeek
+Problem-resolution pipeline for 3 months: June, July, August 2024.
+Top 50 users by tweet volume. Reuses few-shot examples from the week study.
 """
 
 # %%
 import json
 import os
-import random
 import sys
 from collections import Counter, defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -35,34 +29,39 @@ if str(SCRATCHPADS_DIR) not in sys.path:
 from lib.strand_caches import load_caches, get_quote_tweets_dict  # noqa: E402
 from lib.problem_analysis import (  # noqa: E402
     normalize_username, is_top_level_original, tweet_record,
-    parse_eligible_usernames, parse_json_from_llm,
-    classify_problem_batch, classify_outcome_batch,
+    parse_eligible_usernames, classify_problem_batch, classify_outcome_batch,
     collect_descendant_ids, format_tweet_line,
 )
 
 # %%
 # === Configuration ===
 
-OUTPUT_DIR = SCRATCHPADS_DIR / "data" / "problem_resolution"
+WEEK_OUTPUT_DIR = SCRATCHPADS_DIR / "data" / "problem_resolution"
+OUTPUT_DIR = SCRATCHPADS_DIR / "data" / "problem_resolution" / "3month"
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 RAW_USER_DIRECTORY_PATH = SCRATCHPADS_DIR / "data" / "raw_copy_paste_user_directory.txt"
-TWEET_ID_SUBSETS_PATH = OUTPUT_DIR / "tweet_id_subsets_aug2024.json"
-FEW_SHOT_PROBLEM_PATH = OUTPUT_DIR / "few_shot_problem_classification.json"
-DEEPSEEK_OUTPUT_PATH = OUTPUT_DIR / "week_aug_last_top_level_problem_classification_deepseek.json"
+
+# Reuse few-shot files from the week study
+FEW_SHOT_PROBLEM_PATH = WEEK_OUTPUT_DIR / "few_shot_problem_classification.json"
+FEW_SHOT_OUTCOME_PATH = WEEK_OUTPUT_DIR / "few_shot_outcome_classification.json"
+
+# Source: six-month subset built in notebook 28
+TWEET_ID_SUBSETS_PATH = WEEK_OUTPUT_DIR / "tweet_id_subsets_aug2024.json"
+
+# Outputs for this run
+PROBLEM_CLASSIFICATION_PATH = OUTPUT_DIR / "problem_classification_deepseek.json"
 PROBLEM_THREADS_PATH = OUTPUT_DIR / "problem_threads.json"
-FEW_SHOT_OUTCOME_PATH = OUTPUT_DIR / "few_shot_outcome_classification.json"
-OUTCOME_OUTPUT_PATH = OUTPUT_DIR / "problem_outcome_classification_deepseek.json"
+OUTCOME_CLASSIFICATION_PATH = OUTPUT_DIR / "outcome_classification_deepseek.json"
 USER_HISTORIES_PATH = OUTPUT_DIR / "user_tweet_histories.json"
 
-WEEK_START = "2024-08-25 00:00:00"  # inclusive
-WEEK_END = "2024-09-01 00:00:00"  # exclusive
-SIX_MONTH_START = "2024-03-01 00:00:00"  # inclusive
-SIX_MONTH_END = "2024-09-01 00:00:00"  # exclusive
+THREE_MONTH_START = "2024-06-01 00:00:00"  # inclusive
+THREE_MONTH_END = "2024-09-01 00:00:00"  # exclusive
 
 ARCHIVE_UPLOAD_CUTOFF = pd.Timestamp("2025-09-01")
-TOP_N_USERS = 20
-DEEPSEEK_BATCH_SIZE = 100
+TOP_N_USERS = 50
+PROBLEM_BATCH_SIZE = 50
+OUTCOME_BATCH_SIZE = 10
 DEEPSEEK_MODEL = "deepseek-chat"
 DEEPSEEK_PARALLEL_CALLS = 30
 
@@ -73,58 +72,49 @@ tweet_dict, conversation_trees = load_caches(auto_generate=False)
 print(f"Loaded {len(tweet_dict):,} tweets, {len(conversation_trees):,} conversation trees")
 
 # %%
-# === Build or load tweet-id subsets by date range ===
+# === Filter six-month ids down to June-August 2024 ===
 
-if TWEET_ID_SUBSETS_PATH.exists():
-    with TWEET_ID_SUBSETS_PATH.open("r") as f:
-        subset_data = json.load(f)
-    week_ids = [int(tid) for tid in subset_data["tweet_ids"]["week_last_aug_2024"]]
-    six_month_ids = [int(tid) for tid in subset_data["tweet_ids"]["six_month_to_sep_2024"]]
-else:
-    week_ids, six_month_ids = [], []
-    for tweet_id in tqdm(tweet_dict, desc="Filtering tweets by date"):
-        created_at = str(tweet_dict[tweet_id].get("created_at", ""))[:19]
-        if len(created_at) != 19:
-            continue
-        if WEEK_START <= created_at < WEEK_END:
-            week_ids.append(int(tweet_id))
-        if SIX_MONTH_START <= created_at < SIX_MONTH_END:
-            six_month_ids.append(int(tweet_id))
+with TWEET_ID_SUBSETS_PATH.open("r") as f:
+    subset_data = json.load(f)
+six_month_ids = [int(tid) for tid in subset_data["tweet_ids"]["six_month_to_sep_2024"]]
 
-    with TWEET_ID_SUBSETS_PATH.open("w") as f:
-        json.dump({
-            "generated_at": datetime.utcnow().isoformat(timespec="seconds") + "Z",
-            "tweet_ids": {"week_last_aug_2024": week_ids, "six_month_to_sep_2024": six_month_ids},
-        }, f)
+three_month_ids = []
+for tid in tqdm(six_month_ids, desc="Filtering to Jun-Aug"):
+    tweet = tweet_dict.get(tid)
+    if not tweet:
+        continue
+    created_at = str(tweet.get("created_at", ""))[:19]
+    if THREE_MONTH_START <= created_at < THREE_MONTH_END:
+        three_month_ids.append(tid)
 
-print(f"Week subset: {len(week_ids):,} tweets | Six-month subset: {len(six_month_ids):,} tweets")
+print(f"Three-month subset (Jun-Aug 2024): {len(three_month_ids):,} tweets")
 
 # %%
-# === Find top users by tweet volume (eligible users only) ===
+# === Find top 50 eligible users by tweet volume ===
 
 eligible_users = parse_eligible_usernames(RAW_USER_DIRECTORY_PATH, ARCHIVE_UPLOAD_CUTOFF)
 
-week_counts: Counter = Counter()
-for tid in week_ids:
+user_counts: Counter = Counter()
+for tid in three_month_ids:
     tweet = tweet_dict.get(tid)
     if tweet:
         username = normalize_username(tweet.get("username", ""))
         if username in eligible_users:
-            week_counts[username] += 1
+            user_counts[username] += 1
 
-top_users = week_counts.most_common(TOP_N_USERS)
+top_users = user_counts.most_common(TOP_N_USERS)
+top_usernames = {u for u, _ in top_users}
 
-print(f"\nTop {TOP_N_USERS} users (last week Aug 2024):")
+print(f"\nTop {TOP_N_USERS} users (Jun-Aug 2024):")
 for i, (user, count) in enumerate(top_users, 1):
     print(f"  {i:>2}. @{user:<22} {count:>5} tweets")
 
 # %%
 # === Collect top-level tweets for top users ===
 
-top_usernames = {u for u, _ in top_users}
 top_level_by_user: dict[str, list[dict]] = defaultdict(list)
 
-for tid in week_ids:
+for tid in three_month_ids:
     tweet = tweet_dict.get(tid)
     if not tweet:
         continue
@@ -141,58 +131,51 @@ print(f"Top-level original tweets from top {TOP_N_USERS} users: {len(all_top_lev
 # %%
 # === Classify tweets as problem statements via DeepSeek ===
 
-if not all_top_level:
-    print("No tweets to classify.")
-else:
-    from openai import OpenAI
+from openai import OpenAI
 
-    client = OpenAI(
-        api_key=os.environ["DEEPSEEK_API_KEY"],
-        base_url=os.environ.get("DEEPSEEK_BASE_URL", "https://api.deepseek.com"),
-    )
+client = OpenAI(
+    api_key=os.environ["DEEPSEEK_API_KEY"],
+    base_url=os.environ.get("DEEPSEEK_BASE_URL", "https://api.deepseek.com"),
+)
 
-    # Load few-shot examples for problem classification
-    few_shot = []
-    if FEW_SHOT_PROBLEM_PATH.exists():
-        with FEW_SHOT_PROBLEM_PATH.open("r") as f:
-            few_shot = json.load(f).get("examples", [])
-        print(f"Few-shot examples: {len(few_shot)}")
+# Load few-shot examples for problem classification (from the week study)
+few_shot_problem = []
+if FEW_SHOT_PROBLEM_PATH.exists():
+    with FEW_SHOT_PROBLEM_PATH.open("r") as f:
+        few_shot_problem = json.load(f).get("examples", [])
+    print(f"Problem few-shot examples: {len(few_shot_problem)}")
+# %%
+batches = [all_top_level[i:i + PROBLEM_BATCH_SIZE] for i in range(0, len(all_top_level), PROBLEM_BATCH_SIZE)]
+completed: dict[int, list[dict]] = {}
 
-    # Run classification in parallel batches
-    batches = [all_top_level[i:i + DEEPSEEK_BATCH_SIZE] for i in range(0, len(all_top_level), DEEPSEEK_BATCH_SIZE)]
-    completed: dict[int, list[dict]] = {}
+with ThreadPoolExecutor(max_workers=DEEPSEEK_PARALLEL_CALLS) as executor:
+    futures = {
+        executor.submit(classify_problem_batch, client, batch, DEEPSEEK_MODEL, few_shot_problem): idx
+        for idx, batch in enumerate(batches)
+    }
+    for future in tqdm(as_completed(futures), total=len(futures), desc="DeepSeek problem classify"):
+        completed[futures[future]] = future.result()
 
-    with ThreadPoolExecutor(max_workers=DEEPSEEK_PARALLEL_CALLS) as executor:
-        futures = {
-            executor.submit(classify_problem_batch, client, batch, DEEPSEEK_MODEL, few_shot): idx
-            for idx, batch in enumerate(batches)
-        }
-        for future in tqdm(as_completed(futures), total=len(futures), desc="DeepSeek classify"):
-            completed[futures[future]] = future.result()
+flat_results = [r for idx in sorted(completed) for r in completed[idx]]
 
-    flat_results = [r for idx in sorted(completed) for r in completed[idx]]
+with PROBLEM_CLASSIFICATION_PATH.open("w") as f:
+    json.dump({
+        "generated_at": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+        "model": DEEPSEEK_MODEL,
+        "total_tweets": len(all_top_level),
+        "few_shot_count": len(few_shot_problem),
+        "results": flat_results,
+    }, f, indent=2)
 
-    with DEEPSEEK_OUTPUT_PATH.open("w") as f:
-        json.dump({
-            "generated_at": datetime.utcnow().isoformat(timespec="seconds") + "Z",
-            "model": DEEPSEEK_MODEL,
-            "total_tweets": len(all_top_level),
-            "few_shot_count": len(few_shot),
-            "results": flat_results,
-        }, f, indent=2)
-
-    print(f"Saved {len(flat_results):,} classifications to {DEEPSEEK_OUTPUT_PATH.name}")
+print(f"Saved {len(flat_results):,} classifications to {PROBLEM_CLASSIFICATION_PATH.name}")
 
 # %%
-# === Load problem tweet ids from classification results ===
+# === Load problem tweet ids ===
 
-with DEEPSEEK_OUTPUT_PATH.open("r") as f:
+with PROBLEM_CLASSIFICATION_PATH.open("r") as f:
     classification_data = json.load(f)
 
-problem_ids = [
-    r["tweet_id"] for r in classification_data["results"]
-    if r.get("is_problem") is True
-]
+problem_ids = [r["tweet_id"] for r in classification_data["results"] if r.get("is_problem") is True]
 print(f"Problem tweets: {len(problem_ids)}")
 
 # %%
@@ -201,7 +184,7 @@ print(f"Problem tweets: {len(problem_ids)}")
 quote_tweets_dict = get_quote_tweets_dict()
 
 # %%
-# === Gather replies + quotes for each problem tweet, format as thread strings ===
+# === Build problem threads ===
 
 problem_threads: list[dict] = []
 
@@ -210,20 +193,13 @@ for tweet_id in problem_ids:
     if not root_tweet:
         continue
 
-    # Collect reply ids from the conversation tree (key = conversation_id = tweet_id for top-level)
     reply_ids = []
     tree = conversation_trees.get(tweet_id) or conversation_trees.get(str(tweet_id))
     if tree:
         reply_ids = collect_descendant_ids(tree, tweet_id)
 
-    # Collect quote tweet ids
-    quote_ids = (
-        quote_tweets_dict.get(tweet_id, [])
-        or quote_tweets_dict.get(str(tweet_id), [])
-        or []
-    )
+    quote_ids = quote_tweets_dict.get(tweet_id, []) or quote_tweets_dict.get(str(tweet_id), []) or []
 
-    # Build labeled tweet records: (created_at, label, tweet_dict_entry)
     context_tweets = []
     for rid in reply_ids:
         t = tweet_dict.get(rid)
@@ -234,25 +210,22 @@ for tweet_id in problem_ids:
         if t:
             context_tweets.append((str(t.get("created_at", ""))[:19], "quote", t))
 
-    # Sort oldest first
     context_tweets.sort(key=lambda x: x[0])
 
-    # Format the thread string
     lines = [format_tweet_line(root_tweet, "problem")]
-    for _, label, t in context_tweets:
-        lines.append(format_tweet_line(t, label))
-    thread_string = "\n".join(lines)
+    for _, tag, t in context_tweets:
+        lines.append(format_tweet_line(t, tag))
 
     problem_threads.append({
         "tweet_id": tweet_id,
         "reply_count": len(reply_ids),
         "quote_count": len([qid for qid in quote_ids if tweet_dict.get(qid)]),
-        "thread": thread_string,
+        "thread": "\n".join(lines),
     })
 
 print(f"Built {len(problem_threads)} problem threads")
-print(f"Threads with replies: {sum(1 for t in problem_threads if t['reply_count'] > 0)}")
-print(f"Threads with quotes: {sum(1 for t in problem_threads if t['quote_count'] > 0)}")
+print(f"  with replies: {sum(1 for t in problem_threads if t['reply_count'] > 0)}")
+print(f"  with quotes: {sum(1 for t in problem_threads if t['quote_count'] > 0)}")
 
 # %%
 # === Save problem threads ===
@@ -266,20 +239,13 @@ with PROBLEM_THREADS_PATH.open("w") as f:
 
 print(f"Saved to {PROBLEM_THREADS_PATH.name}")
 
-# Preview first thread
-if problem_threads:
-    print(f"\n--- Example thread (tweet {problem_threads[0]['tweet_id']}) ---")
-    print(problem_threads[0]["thread"])
-
 # %%
 # === Classify problem thread outcomes via DeepSeek ===
 
-# Load few-shot examples
 with FEW_SHOT_OUTCOME_PATH.open("r") as f:
     few_shot_outcome = json.load(f)["examples"]
-print(f"Few-shot outcome examples: {len(few_shot_outcome)}")
+print(f"Outcome few-shot examples: {len(few_shot_outcome)}")
 
-# Filter out threads already in the few-shot set
 few_shot_ids = {int(e["tweet_id"]) for e in few_shot_outcome}
 non_few_shot = [t for t in problem_threads if t["tweet_id"] not in few_shot_ids]
 
@@ -292,18 +258,6 @@ no_reply_results = [
 threads_to_classify = [t for t in non_few_shot if t["reply_count"] > 0 or t["quote_count"] > 0]
 print(f"Threads to classify: {len(threads_to_classify)} via DeepSeek, {len(no_reply_results)} trivially unresolved (no reply)")
 
-# %%
-# === Run outcome classification in parallel ===
-
-from openai import OpenAI
-
-outcome_client = OpenAI(
-    api_key=os.environ["DEEPSEEK_API_KEY"],
-    base_url=os.environ.get("DEEPSEEK_BASE_URL", "https://api.deepseek.com"),
-)
-
-# Batch size of 5 since threads are much longer than individual tweets
-OUTCOME_BATCH_SIZE = 5
 outcome_batches = [
     threads_to_classify[i:i + OUTCOME_BATCH_SIZE]
     for i in range(0, len(threads_to_classify), OUTCOME_BATCH_SIZE)
@@ -312,7 +266,7 @@ completed_outcomes: dict[int, list[dict]] = {}
 
 with ThreadPoolExecutor(max_workers=DEEPSEEK_PARALLEL_CALLS) as executor:
     futures = {
-        executor.submit(classify_outcome_batch, outcome_client, batch, DEEPSEEK_MODEL, few_shot_outcome): idx
+        executor.submit(classify_outcome_batch, client, batch, DEEPSEEK_MODEL, few_shot_outcome): idx
         for idx, batch in enumerate(outcome_batches)
     }
     for future in tqdm(as_completed(futures), total=len(futures), desc="DeepSeek outcome classify"):
@@ -320,7 +274,7 @@ with ThreadPoolExecutor(max_workers=DEEPSEEK_PARALLEL_CALLS) as executor:
 
 outcome_results = no_reply_results + [r for idx in sorted(completed_outcomes) for r in completed_outcomes[idx]]
 
-with OUTCOME_OUTPUT_PATH.open("w") as f:
+with OUTCOME_CLASSIFICATION_PATH.open("w") as f:
     json.dump({
         "generated_at": datetime.utcnow().isoformat(timespec="seconds") + "Z",
         "model": DEEPSEEK_MODEL,
@@ -330,11 +284,9 @@ with OUTCOME_OUTPUT_PATH.open("w") as f:
         "results": outcome_results,
     }, f, indent=2, ensure_ascii=False)
 
-print(f"Saved {len(outcome_results)} outcome classifications to {OUTCOME_OUTPUT_PATH.name}")
+print(f"Saved {len(outcome_results)} outcome classifications to {OUTCOME_CLASSIFICATION_PATH.name}")
 
-# Summary
-from collections import Counter as _Counter
-label_counts = _Counter(r["label"] for r in outcome_results)
+label_counts = Counter(r["label"] for r in outcome_results)
 for label, count in label_counts.most_common():
     print(f"  {label}: {count}")
 
@@ -346,20 +298,22 @@ outcome_by_id: dict[int, dict] = {}
 for r in outcome_results:
     outcome_by_id[int(r["tweet_id"])] = r
 for e in few_shot_outcome:
-    outcome_by_id[int(e["tweet_id"])] = {
-        "tweet_id": int(e["tweet_id"]),
-        "label": e["label"],
-        "confidence": "high",
-        "reason": e.get("rationale", "manual few-shot label"),
-    }
+    tid = int(e["tweet_id"])
+    if tid in {p["tweet_id"] for p in problem_threads}:
+        outcome_by_id[tid] = {
+            "tweet_id": tid,
+            "label": e["label"],
+            "confidence": "high",
+            "reason": e.get("rationale", "manual few-shot label"),
+        }
 
 problem_id_set = set(problem_ids)
 
-# Single pass over week_ids, bucket by username
+# Single pass over three_month_ids, bucket by username
 user_tweets: dict[str, list] = defaultdict(list)
 user_problems: dict[str, list] = defaultdict(list)
 
-for tid in week_ids:
+for tid in three_month_ids:
     tweet = tweet_dict.get(tid)
     if not tweet:
         continue
@@ -386,7 +340,7 @@ for tid in week_ids:
 user_histories: dict[str, dict] = {}
 for username in top_usernames:
     tweets_list = sorted(user_tweets.get(username, []), key=lambda t: t["created_at"])
-    problems_list = sorted(user_problems.get(username, []), key=lambda t: t["created_at"])
+    problems_list = sorted(user_problems.get(username, []), key=lambda t: str(t.get("created_at", "")))
     user_histories[username] = {
         "username": username,
         "tweet_count": len(tweets_list),
@@ -398,7 +352,7 @@ for username in top_usernames:
 with USER_HISTORIES_PATH.open("w") as f:
     json.dump({
         "generated_at": datetime.utcnow().isoformat(timespec="seconds") + "Z",
-        "week_range": {"start_inclusive": WEEK_START, "end_exclusive": WEEK_END},
+        "range": {"start_inclusive": THREE_MONTH_START, "end_exclusive": THREE_MONTH_END},
         "users": user_histories,
     }, f, indent=2, ensure_ascii=False)
 
