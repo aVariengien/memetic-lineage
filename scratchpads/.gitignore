@@ -4,3 +4,16 @@ thread_texts.json
 data/top_quoted_strands.json
 data/top_quoted_strands_.json
 top_quoted_tweet_ids.json
+data/rated_strands_lite
+data/rated_strands_incomplete
+data/all_tweet_embeddings
+exploration_workspace
+
+# Backups and generated files
+data/rated_strands.zip
+data/semantic_search_backups/
+tweet_datamapplot*.html
+
+# WIP analysis directories
+ignore_old_*/
+story_analysis/

@@ -26,3 +26,19 @@ scratchpads/data/example_strands
 scratchpads/data/*_old
 cluster_reports.zip
 cluster_volume_evolution.png
+
+# Tooling artifacts
+.claude/
+.playwright-mcp/
+
+# Note: bangers/public/*.json data files ARE committed for Vercel deployment
+
+# Strands exploration workspace (research notes, not for git)
+strands-exploration/
+
+# Debug / scratch
+Untitled
+scratchpads/data/debug_quote_counts.json
+
+# Screenshots in root
+/*.png

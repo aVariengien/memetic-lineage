@@ -30,7 +30,14 @@ __all__ = [
     "is_transient_error",
     "load_caches",
     "get_quote_tweets_dict",
+    "get_filtered_quote_tweets_dict",
     "generate_caches",
+    "generate_filtered_quote_cache",
+    "AccountConversationsResult",
+    "get_account_tweets",
+    "get_account_conversations",
+    "save_account_conversations",
+    "explore_account",
 ]
 
 _EXPORT_TO_MODULE = {
@@ -54,7 +61,14 @@ _EXPORT_TO_MODULE = {
     "is_transient_error": "retry",
     "load_caches": "strand_caches",
     "get_quote_tweets_dict": "strand_caches",
+    "get_filtered_quote_tweets_dict": "strand_caches",
     "generate_caches": "strand_caches",
+    "generate_filtered_quote_cache": "strand_caches",
+    "AccountConversationsResult": "account_explorer",
+    "get_account_tweets": "account_explorer",
+    "get_account_conversations": "account_explorer",
+    "save_account_conversations": "account_explorer",
+    "explore_account": "account_explorer",
 }
 
 
@@ -70,4 +84,3 @@ def __getattr__(name: str):
 
 def __dir__() -> list[str]:
     return sorted(set(globals()) | set(__all__))
-
