@@ -1,5 +1,8 @@
 # %%
-from .image_describer import MediaDescription
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
+
 import pandas as pd
 import numpy as np
 from collections import defaultdict
@@ -20,6 +23,9 @@ from typing import (
 )
 
 import tqdm
+
+if TYPE_CHECKING:
+    from .image_describer import MediaDescription
 
 
 class EnrichedTweet(TypedDict):

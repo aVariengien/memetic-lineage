@@ -1,45 +1,73 @@
-# Strand building pipeline
-from .strand_builder import (
-    StrandSeed,
-    StrandBuildResult,
-    get_strand_seeds,
-    build_strand_single,
-    build_strands_phased,
-)
+"""Lightweight package exports for `scratchpads.lib`.
 
-# Strand rating
-from .strand_rater import (
-    RatedStrandResult,
-    rate_strand,
-    rate_strands_batch,
-)
+Keep package import side effects minimal so callers can import individual helpers
+without transitively requiring optional dependencies such as image-description or
+LLM tooling.
+"""
 
-# Image descriptions
-from .image_describer import (
-    MediaDescription,
-    get_image_cache,
-    get_image_descriptions,
-    get_image_descriptions_batch,
-)
+from __future__ import annotations
 
-# Parallelism utilities
-from .parallel import (
-    parallel_map_to_dict,
-    parallel_map_to_dict_with_context,
-    batch_keys,
-)
+from importlib import import_module
 
-# Retry utilities
-from .retry import (
-    with_retry,
-    is_rate_limit_error,
-    is_transient_error,
-)
+__all__ = [
+    "StrandSeed",
+    "StrandBuildResult",
+    "get_strand_seeds",
+    "build_strand_single",
+    "build_strands_phased",
+    "RatedStrandResult",
+    "rate_strand",
+    "rate_strands_batch",
+    "MediaDescription",
+    "get_image_cache",
+    "get_image_descriptions",
+    "get_image_descriptions_batch",
+    "parallel_map_to_dict",
+    "parallel_map_to_dict_with_context",
+    "batch_keys",
+    "with_retry",
+    "is_rate_limit_error",
+    "is_transient_error",
+    "load_caches",
+    "get_quote_tweets_dict",
+    "generate_caches",
+]
 
-# Caches
-from .strand_caches import (
-    load_caches,
-    get_quote_tweets_dict,
-    generate_caches,
-)
+_EXPORT_TO_MODULE = {
+    "StrandSeed": "strand_builder",
+    "StrandBuildResult": "strand_builder",
+    "get_strand_seeds": "strand_builder",
+    "build_strand_single": "strand_builder",
+    "build_strands_phased": "strand_builder",
+    "RatedStrandResult": "strand_rater",
+    "rate_strand": "strand_rater",
+    "rate_strands_batch": "strand_rater",
+    "MediaDescription": "image_describer",
+    "get_image_cache": "image_describer",
+    "get_image_descriptions": "image_describer",
+    "get_image_descriptions_batch": "image_describer",
+    "parallel_map_to_dict": "parallel",
+    "parallel_map_to_dict_with_context": "parallel",
+    "batch_keys": "parallel",
+    "with_retry": "retry",
+    "is_rate_limit_error": "retry",
+    "is_transient_error": "retry",
+    "load_caches": "strand_caches",
+    "get_quote_tweets_dict": "strand_caches",
+    "generate_caches": "strand_caches",
+}
+
+
+def __getattr__(name: str):
+    module_name = _EXPORT_TO_MODULE.get(name)
+    if module_name is None:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    module = import_module(f".{module_name}", __name__)
+    value = getattr(module, name)
+    globals()[name] = value
+    return value
+
+
+def __dir__() -> list[str]:
+    return sorted(set(globals()) | set(__all__))
 
