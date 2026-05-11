@@ -23,19 +23,24 @@ The two pools are deduplicated, sorted by representative_tweet_id, and
 shuffled with a seed tied to the focal username so the order is
 deterministic across reloads. In normal mode the UI hides everything that would leak ground truth or
 source: no direction, no path_anchor_username, no indication of focal vs
-neighbor, no tweet text, no tweet id, no link. Optional **review mode**
-(checkbox) shows `clean_labels` ground truth plus **every** Cursor agent
+neighbor, no tweet text, no tweet id, no link. **Review mode** (sidebar
+checkbox; on by default) shows `clean_labels` ground truth plus **every** Cursor agent
 prediction run folder under `data/labels/cursor_agent_predictions/`
 (auto-discovered subfolders), as a compact emoji table plus reasoning — read-only — and
 disables labeling controls.
 
-**Review mode** also adds an **Aggregate metrics** tab with accuracy, weighted
-and macro F1, per-class F1, multiclass Brier, marginal baseline Brier, Brier
-skill vs that baseline, one-vs-rest **ROC** curves (human + models), and confusion
-matrices (vs `clean_labels` GT). For ROC, the human track uses soft probabilities
-(**prob_endorse** / **prob_disendorse** / **prob_neutral**) from
-``predictions_top5_jul2024_human_probs.json`` when that focal/tweet row exists;
-otherwise it falls back to a one-hot vector from saved UI labels.
+**Review mode** also adds an **Aggregate metrics** tab with accuracy, Brier
+skill vs marginal baseline, **weighted AUROC** (one-vs-rest average weighted
+by GT class frequency; same family as the ROC figures), weighted and macro F1,
+per-class F1, multiclass Brier,
+marginal baseline Brier, one-vs-rest **ROC** curves (human + models),
+one-vs-rest **FDR–recall** curves (false-discovery rate vs recall, also human +
+models, with each curve scored on **only** the rows that model can predict — i.e.
+its own support — and the support shown in each legend entry), and confusion
+matrices (vs `clean_labels` GT). Human probability metrics (Brier / skill / ROC /
+FDR–recall) use **only** soft probabilities (**prob_endorse** / **prob_disendorse** /
+**prob_neutral**) from ``predictions_top5_jul2024_human_probs.json``; rows without
+that triple are excluded from the human track (no one-hot fallback).
 
 The labeler sees `target_entity`, `longer_name`, and `url` when the URL
 is not an x.com link (x.com URLs are hidden in the UI). `context` is not
@@ -75,7 +80,7 @@ import threading
 from datetime import datetime, timezone
 from pathlib import Path
 from random import Random
-from typing import Any
+from typing import Any, Callable
 from urllib.parse import urlparse
 
 import matplotlib
@@ -85,7 +90,16 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import streamlit as st
-from sklearn.metrics import accuracy_score, auc, confusion_matrix, f1_score, roc_curve
+from sklearn.metrics import (
+    accuracy_score,
+    auc,
+    average_precision_score,
+    confusion_matrix,
+    f1_score,
+    precision_recall_curve,
+    roc_auc_score,
+    roc_curve,
+)
 
 # ---------------------------------------------------------------------------
 # Static config
@@ -174,6 +188,40 @@ EMOJI_MISSING = "—"
 # 3-way eval (must match clean_labels ground_truth_label strings).
 GT_CLASSES: tuple[str, ...] = ("endorsing", "disendorsing", "neutral")
 
+# Composite eval key. The same tweet can carry multiple endorsement targets, each with
+# its own GT label and per-model probability — every source file
+# (`clean_labels/ground_truth_*.json`, `cursor_agent_predictions/<run>/predictions_*.json`,
+# `predictions_top5_jul2024_human_probs.json`) treats them as distinct rows. Keying by
+# `representative_tweet_id` alone silently collapses them and risks pairing a row's GT
+# with another target's prediction. We key all eval lookups by `(tid, target_entity)`.
+EvalKey = tuple[int, str]
+
+
+def _eval_key(rec: dict[str, Any]) -> EvalKey | None:
+    """Composite key from any clean / pred / human record; ``None`` if either field is missing."""
+    tid = rec.get("representative_tweet_id")
+    tgt = rec.get("target_entity")
+    if tid is None or tgt is None:
+        return None
+    return (int(tid), str(tgt))
+
+# ROC stacked figure (3 OvR panels): each panel uses ``set_aspect("equal")`` so the axes box
+# is square; ``figsize`` width = axes box (height-bound at ~H/3) + horizontal room for the
+# right-side legend. ``dpi`` fixes native raster density so Streamlit scaling stays sharp.
+ROC_OVR_FIGSIZE_W_IN: float = 6.5
+ROC_OVR_FIGSIZE_H_IN: float = 8.4
+ROC_OVR_FIGURE_DPI: float = 100.0
+ROC_OVR_LINEWIDTH: float = 1.2
+ROC_OVR_DIAG_LINEWIDTH: float = 0.7
+ROC_OVR_TITLE_FONTSIZE: float = 9.5
+ROC_OVR_AXIS_LABEL_FONTSIZE: float = 8.5
+ROC_OVR_TICK_FONTSIZE: float = 7.5
+ROC_OVR_LEGEND_FONTSIZE: float = 7.0
+ROC_OVR_GRID_LINEWIDTH: float = 0.5
+ROC_OVR_GRID_LINESTYLE: str = ":"
+ROC_OVR_GRID_COLOR: str = "0.7"
+ROC_OVR_GRID_ALPHA: float = 0.6
+
 
 def list_cursor_prediction_run_folders(cursor_root: str) -> list[str]:
     """All direct subfolders under cursor_agent_predictions/ (excluding dot-prefixed names).
@@ -201,6 +249,29 @@ def _abbrev_run_folder(name: str, max_len: int = 40) -> str:
     if len(base) <= max_len:
         return base
     return base[: max_len - 1] + "…"
+
+
+def _unique_abbrev_labels_for_runs(prediction_runs: list[str]) -> list[str]:
+    """Display names for run folders: after timestamp strip, suffix -1, -2, … when bases collide."""
+    abbrevs = [_abbrev_run_folder(r) for r in prediction_runs]
+    dup_count: dict[str, int] = {}
+    for a in abbrevs:
+        dup_count[a] = dup_count.get(a, 0) + 1
+    index_in_base: dict[str, int] = {}
+    out: list[str] = []
+    for a in abbrevs:
+        if dup_count[a] == 1:
+            out.append(a)
+        else:
+            index_in_base[a] = index_in_base.get(a, 0) + 1
+            out.append(f"{a}-{index_in_base[a]}")
+    return out
+
+
+def _truncate_display(s: str, max_len: int = 64) -> str:
+    if len(s) <= max_len:
+        return s
+    return s[: max_len - 1] + "…"
 
 
 def _emoji_for_agent_prediction(pred: dict[str, Any] | None) -> str:
@@ -246,24 +317,43 @@ def _review_comparison_md_row(
     clean_rec: dict[str, Any] | None,
     human_label: str | None,
     prediction_runs: list[str],
-    pred_by_run: dict[str, dict[int, dict[str, Any]]],
-    tid_i: int,
+    run_display_labels: list[str],
+    pred_by_run: dict[str, dict[EvalKey, dict[str, Any]]],
+    eval_key: EvalKey,
 ) -> None:
-    """Single-row GitHub-flavored markdown table: GT · Human · each model."""
-    hdrs = (
-        ["GT"]
-        + ["Human"]
-        + [_abbrev_run_folder(r) for r in prediction_runs]
+    """Single-row GitHub-flavored markdown table: GT · Human · each model.
+
+    Columns are omitted when the value would be absent (—): no GT row, no saved
+    human label, or no model prediction for this ``(tid, target_entity)``/run.
+    """
+    hdrs: list[str] = []
+    cells: list[str] = []
+
+    gt_raw = (
+        clean_rec.get("ground_truth_label") if clean_rec else None
     )
-    cells: list[str] = [
-        _emoji_for_ground_truth_label(
-            (clean_rec.get("ground_truth_label") if clean_rec else None)
-        ),
-        _emoji_for_human_label(human_label),
-    ]
-    for run in prediction_runs:
-        pr = pred_by_run.get(run, {}).get(tid_i)
+    gt_cell = _emoji_for_ground_truth_label(gt_raw)
+    if gt_cell != EMOJI_MISSING:
+        hdrs.append("GT")
+        cells.append(gt_cell)
+
+    hum_cell = _emoji_for_human_label(human_label)
+    if hum_cell != EMOJI_MISSING:
+        hdrs.append("Human")
+        cells.append(hum_cell)
+
+    for run, disp in zip(prediction_runs, run_display_labels, strict=True):
+        pr = pred_by_run.get(run, {}).get(eval_key)
+        if pr is None:
+            continue
+        hdrs.append(disp)
         cells.append(_emoji_for_agent_prediction(pr))
+
+    if not hdrs:
+        st.caption(
+            "_No ground truth row, saved human label, or model predictions for this item._"
+        )
+        return
 
     header_line = "| " + " | ".join(hdrs) + " |"
     separator_line = "| " + " | ".join([":---:"] * len(hdrs)) + " |"
@@ -340,51 +430,61 @@ def load_clean_label_allowed_ids(clean_labels_dir: str) -> dict[str, set[int]]:
 
 
 @st.cache_data(show_spinner=False)
-def load_clean_label_items_by_tweet_id(
+def load_clean_label_items_by_key(
     clean_labels_dir: str, focal_user: str
-) -> dict[int, dict[str, Any]]:
-    """Map representative_tweet_id -> full row from ground_truth_{focal}.json."""
+) -> dict[EvalKey, dict[str, Any]]:
+    """Map (representative_tweet_id, target_entity) -> full row from ground_truth_{focal}.json.
+
+    Multi-target tweets occupy multiple keys, one per target.
+    """
     path = Path(clean_labels_dir) / f"ground_truth_{focal_user}.json"
     if not path.exists():
         return {}
     data = load_json(path)
-    out: dict[int, dict[str, Any]] = {}
+    out: dict[EvalKey, dict[str, Any]] = {}
     for item in data.get("items") or []:
-        tid = item.get("representative_tweet_id")
-        if tid is not None:
-            out[int(tid)] = item
+        key = _eval_key(item)
+        if key is not None:
+            out[key] = item
     return out
 
 
 @st.cache_data(show_spinner=False)
-def load_agent_predictions_by_tweet_id(predictions_json_path: str) -> dict[int, dict[str, Any]]:
-    """Map representative_tweet_id -> prediction dict (reasoning, p_*)."""
+def load_agent_predictions_by_key(
+    predictions_json_path: str,
+) -> dict[EvalKey, dict[str, Any]]:
+    """Map (representative_tweet_id, target_entity) -> prediction dict (reasoning, p_*).
+
+    Agent runs predict per (tid, target), so multi-target tweets get one entry per target.
+    """
     path = Path(predictions_json_path)
     if not path.exists():
         return {}
     data = load_json(path)
-    out: dict[int, dict[str, Any]] = {}
+    out: dict[EvalKey, dict[str, Any]] = {}
     for pred in data.get("predictions") or []:
-        tid = pred.get("representative_tweet_id")
-        if tid is not None:
-            out[int(tid)] = pred
+        key = _eval_key(pred)
+        if key is not None:
+            out[key] = pred
     return out
 
 
 @st.cache_data(show_spinner=False)
-def load_human_probs_by_focal_user(json_path: str) -> dict[str, dict[int, dict[str, Any]]]:
-    """Map focal -> representative_tweet_id -> label record (incl. prob_* from human_probs file)."""
+def load_human_probs_by_focal_user(
+    json_path: str,
+) -> dict[str, dict[EvalKey, dict[str, Any]]]:
+    """Map focal -> (representative_tweet_id, target_entity) -> label record (incl. prob_*)."""
     path = Path(json_path)
     if not path.is_file():
         return {}
     data = load_json(path)
-    out: dict[str, dict[int, dict[str, Any]]] = {}
+    out: dict[str, dict[EvalKey, dict[str, Any]]] = {}
     for user, block in (data.get("users") or {}).items():
-        m: dict[int, dict[str, Any]] = {}
+        m: dict[EvalKey, dict[str, Any]] = {}
         for rec in block.get("labels") or []:
-            tid = rec.get("representative_tweet_id")
-            if tid is not None:
-                m[int(tid)] = rec
+            key = _eval_key(rec)
+            if key is not None:
+                m[key] = rec
         out[user] = m
     return out
 
@@ -445,6 +545,40 @@ def _human_soft_prob_vec_ordered(rec: dict[str, Any]) -> list[float] | None:
     if pe is None or pd_ is None or pn is None:
         return None
     return [float(pe), float(pd_), float(pn)]
+
+
+def _human_gt_pred_probs_soft_only(
+    rows: list[tuple[str, int, str, str]],
+    human_probs_by_focal: dict[str, dict[EvalKey, dict[str, Any]]] | None,
+    focal_filter: str | None = None,
+) -> tuple[list[str], list[str], list[list[float]]]:
+    """Ground truth, human discrete class (from human_probs `label`), and soft prob vector.
+
+    Only includes evaluation rows where ``predictions_top5_jul2024_human_probs.json``
+    has a record with all three ``prob_*`` fields for that focal and ``(tid, target_entity)``
+    pair. Multi-target tweets are matched per target.
+    """
+    if not human_probs_by_focal:
+        return [], [], []
+    yt: list[str] = []
+    yp: list[str] = []
+    pr: list[list[float]] = []
+    for focal, tid, target, gt in rows:
+        if focal_filter is not None and focal != focal_filter:
+            continue
+        hp = human_probs_by_focal.get(focal, {}).get((int(tid), target))
+        if hp is None:
+            continue
+        pv = _human_soft_prob_vec_ordered(hp)
+        if pv is None:
+            continue
+        hc = human_label_to_gt_class(hp.get("label"))
+        if hc is None:
+            continue
+        yt.append(gt)
+        yp.append(hc)
+        pr.append(pv)
+    return yt, yp, pr
 
 
 def _one_hot(gt_class: str) -> tuple[float, float, float]:
@@ -509,6 +643,7 @@ def _metrics_from_predictions(
         "brier": float("nan"),
         "brier_marginal": float("nan"),
         "brier_skill": None,
+        "weighted_auroc": float("nan"),
         "support": len(y_true),
     }
     n = len(y_true)
@@ -530,6 +665,24 @@ def _metrics_from_predictions(
     out["brier"] = bri
     out["brier_marginal"] = bmar
     out["brier_skill"] = brier_skill_score(bri, bmar)
+    y_score_mx = np.asarray(prob_vecs, dtype=np.float64)
+    # sklearn roc_auc_score(multi_class='ovr') requires `labels` in lex order; remap columns.
+    lbls_ovr = sorted(lbls)
+    if y_score_mx.shape == (n, len(lbls)):
+        idx_perm = [lbls.index(c) for c in lbls_ovr]
+        y_ovr = y_score_mx[:, idx_perm]
+        try:
+            out["weighted_auroc"] = float(
+                roc_auc_score(
+                    y_true,
+                    y_ovr,
+                    multi_class="ovr",
+                    average="weighted",
+                    labels=lbls_ovr,
+                )
+            )
+        except ValueError:
+            out["weighted_auroc"] = float("nan")
     return out
 
 
@@ -538,22 +691,112 @@ def _confusion_df(y_true: list[str], y_pred: list[str]) -> pd.DataFrame:
     return pd.DataFrame(cm, index=[f"GT: {c}" for c in GT_CLASSES], columns=list(GT_CLASSES))
 
 
+# Summary metrics table: bold best value per column (within Predictor rows).
+_SUMMARY_METRICS_HIGHER_IS_BETTER: frozenset[str] = frozenset(
+    {
+        "accuracy",
+        "weighted_f1",
+        "macro_f1",
+        "weighted_auroc",
+        "f1_endorsing",
+        "f1_disendorsing",
+        "f1_neutral",
+        "brier_skill",
+    }
+)
+_SUMMARY_METRICS_LOWER_IS_BETTER: frozenset[str] = frozenset({"brier", "brier_marginal"})
+
+
+def _col_best_boolean_mask(series: pd.Series, *, higher_is_better: bool) -> pd.Series:
+    """True where numeric cell ties column-best (multiple True on ties)."""
+    num = pd.to_numeric(series, errors="coerce")
+    valid = num.notna()
+    if not valid.any():
+        return pd.Series(False, index=series.index)
+    cmp_vals = num[valid]
+    bound = cmp_vals.max() if higher_is_better else cmp_vals.min()
+    out = pd.Series(False, index=series.index)
+    out.loc[valid] = np.isclose(num[valid], bound, rtol=0.0, atol=1e-9)
+    return out
+
+
+def _summary_metrics_bold_mask(dfm_metrics: pd.DataFrame) -> pd.DataFrame:
+    """Same columns/index as dfm_metrics; True = bold cell (Predictor excluded)."""
+    mask = pd.DataFrame(False, index=dfm_metrics.index, columns=dfm_metrics.columns)
+    for col in dfm_metrics.columns:
+        if col == "model":
+            continue
+        if col == "support":
+            continue
+        if col in _SUMMARY_METRICS_HIGHER_IS_BETTER:
+            mask[col] = _col_best_boolean_mask(dfm_metrics[col], higher_is_better=True)
+        elif col in _SUMMARY_METRICS_LOWER_IS_BETTER:
+            mask[col] = _col_best_boolean_mask(dfm_metrics[col], higher_is_better=False)
+    return mask
+
+
+def _styler_css_bold(mask: pd.DataFrame) -> Callable[[pd.DataFrame], pd.DataFrame]:
+    """Return Styler.apply(axis=None) callable; bold cells where mask is True."""
+
+    def _css(_underlying: pd.DataFrame) -> pd.DataFrame:
+        m = mask.reindex(
+            index=_underlying.index, columns=_underlying.columns, fill_value=False
+        )
+        css = pd.DataFrame("", index=_underlying.index, columns=_underlying.columns)
+        css.values[:] = np.where(m.values.astype(bool), "font-weight: bold", "")
+        return css
+
+    return _css
+
+
+def _brier_skill_float_from_metrics(m: dict[str, Any] | None) -> float:
+    """Finite skill value or NaN."""
+    if m is None:
+        return float("nan")
+    sk = m.get("brier_skill")
+    if sk is None:
+        return float("nan")
+    try:
+        x = float(sk)
+    except (TypeError, ValueError):
+        return float("nan")
+    if x != x:
+        return float("nan")
+    return x
+
+
+def _skill_grid_row_best_mask(df_skill_num: pd.DataFrame) -> pd.DataFrame:
+    """Bold highest Brier skill per row (same focal; compare Human vs agents)."""
+    mask = pd.DataFrame(False, index=df_skill_num.index, columns=df_skill_num.columns)
+    for r in df_skill_num.index:
+        row = df_skill_num.loc[r]
+        valid = row.dropna()
+        if len(valid) == 0:
+            continue
+        best = float(valid.max())
+        mask.loc[r] = np.isclose(row.astype(float), best, rtol=0.0, atol=1e-9) & row.notna()
+    return mask
+
+
 def _agent_y_true_and_prob_matrix_for_run(
-    rows: list[tuple[str, int, str]],
+    rows: list[tuple[str, int, str, str]],
     focals: list[str],
     predictions_root: Path,
     run: str,
 ) -> tuple[list[str], np.ndarray] | None:
-    """Ground-truth classes and (n × 3) prob matrix for rows where this run has a pred."""
-    pmap_by_focal: dict[str, dict[int, dict[str, Any]]] = {}
+    """Ground-truth classes and (n × 3) prob matrix for rows where this run has a pred.
+
+    Matches by ``(tid, target_entity)`` so multi-target tweets are scored per target.
+    """
+    pmap_by_focal: dict[str, dict[EvalKey, dict[str, Any]]] = {}
     for fu in focals:
-        pmap_by_focal[fu] = load_agent_predictions_by_tweet_id(
+        pmap_by_focal[fu] = load_agent_predictions_by_key(
             str((predictions_root / run / f"predictions_{fu}.json").resolve())
         )
     y_true: list[str] = []
     probs: list[list[float]] = []
-    for focal, tid, gt in rows:
-        pr = pmap_by_focal.get(focal, {}).get(int(tid))
+    for focal, tid, target, gt in rows:
+        pr = pmap_by_focal.get(focal, {}).get((int(tid), target))
         if pr is None:
             continue
         y_true.append(gt)
@@ -564,167 +807,378 @@ def _agent_y_true_and_prob_matrix_for_run(
 
 
 def _human_y_true_and_prob_matrix(
-    rows: list[tuple[str, int, str]],
-    human_probs_by_focal: dict[str, dict[int, dict[str, Any]]] | None,
-    labels_by_user: dict[str, dict[str, dict[str, Any]]],
+    rows: list[tuple[str, int, str, str]],
+    human_probs_by_focal: dict[str, dict[EvalKey, dict[str, Any]]] | None,
 ) -> tuple[list[str], np.ndarray] | None:
-    """GT vs soft human probs from human_probs JSON when present; else one-hot from saved labels."""
-    y_true: list[str] = []
-    probs: list[list[float]] = []
-    for focal, tid, gt in rows:
-        pv: list[float] | None = None
-        if human_probs_by_focal is not None:
-            hp = human_probs_by_focal.get(focal, {}).get(int(tid))
-            if hp is not None:
-                pv = _human_soft_prob_vec_ordered(hp)
-        if pv is None:
-            rec = labels_by_user.get(focal, {}).get(str(tid))
-            raw = rec.get("label") if rec else None
-            hc = human_label_to_gt_class(raw)
-            if hc is None:
-                continue
-            pv = list(_one_hot(hc))
-        y_true.append(gt)
-        probs.append(pv)
-    if not y_true:
+    """Ground truth vs soft human probs only (``predictions_top5_jul2024_human_probs.json``)."""
+    yt, _yp, pr = _human_gt_pred_probs_soft_only(rows, human_probs_by_focal, None)
+    if not yt:
         return None
-    return y_true, np.asarray(probs, dtype=np.float64)
+    return yt, np.asarray(pr, dtype=np.float64)
 
 
 def render_roc_ovr_curves_for_runs(
     *,
-    rows: list[tuple[str, int, str]],
+    rows: list[tuple[str, int, str, str]],
     focals: list[str],
     predictions_root: Path,
     prediction_runs: list[str],
-    labels_by_user: dict[str, dict[str, dict[str, Any]]],
+    run_display_labels: list[str],
     human_probs_path: Path,
 ) -> None:
-    """One figure: 3 panels (OvR), Human + one curve per agent model."""
+    """One figure: 3 stacked panels (OvR), Human + one curve per agent model."""
+    if len(run_display_labels) != len(prediction_runs):
+        run_display_labels = _unique_abbrev_labels_for_runs(prediction_runs)
     if not rows:
         return
     human_probs_by_focal: dict[str, dict[int, dict[str, Any]]] | None = None
     hp_path = human_probs_path.expanduser().resolve()
     if hp_path.is_file():
         human_probs_by_focal = load_human_probs_by_focal_user(str(hp_path))
-    built_human = _human_y_true_and_prob_matrix(
-        rows, human_probs_by_focal, labels_by_user
-    )
+    built_human = _human_y_true_and_prob_matrix(rows, human_probs_by_focal)
     if not prediction_runs and built_human is None:
         return
     st.markdown("##### ROC curves (one-vs-rest, probability scores)")
     st.caption(
-        "Each panel: binary “this class vs rest” using **predicted probability for that class**. "
-        "Agents: **p_endorsing / p_disendorsing / p_neutral** from each run. "
-        "Human: **prob_endorse / prob_disendorse / prob_neutral** from "
-        "`predictions_top5_jul2024_human_probs.json` when that row exists; otherwise one-hot "
-        "from saved UI labels on this machine. Rows without usable human scores are skipped. "
-        "Dashed diagonal = random."
+        f"Native canvas ≈ **{ROC_OVR_FIGSIZE_W_IN:.1f} × {ROC_OVR_FIGSIZE_H_IN:.1f}** inches at "
+        f"**{ROC_OVR_FIGURE_DPI:.0f} dpi** → **~"
+        f"{int(ROC_OVR_FIGSIZE_W_IN * ROC_OVR_FIGURE_DPI)} × {int(ROC_OVR_FIGSIZE_H_IN * ROC_OVR_FIGURE_DPI)}** px. "
+        "Each panel is binary “this class vs rest” using **predicted probability for that class**. "
+        "Agents: **p_endorsing / p_disendorsing / p_neutral** per run. Human: soft "
+        "**prob_endorse / prob_disendorse / prob_neutral** from "
+        "`predictions_top5_jul2024_human_probs.json`; rows missing that triple omitted. Diagonal = random."
     )
     if not hp_path.is_file():
         st.caption(
-            f"Note: human soft-prob file not found at `{hp_path}`; "
-            "Human ROC uses one-hot from saved labels when a tweet is missing there."
+            f"Note: human soft-prob file not found at `{hp_path}`; Human ROC track is omitted."
         )
-    fig, axes = plt.subplots(1, 3, figsize=(14, 4.2))
-    cmap = plt.get_cmap("tab10")
-    plotted_ovr = [False, False, False]
-    if built_human is not None:
-        y_true_h, P_h = built_human
-        for ci, _cname in enumerate(GT_CLASSES):
-            ax = axes[ci]
-            y_bin = np.array([1 if yt == GT_CLASSES[ci] else 0 for yt in y_true_h], dtype=np.int32)
-            if np.sum(y_bin) == 0 or np.sum(y_bin) == len(y_bin):
-                continue
-            scores = P_h[:, ci]
-            try:
-                fpr, tpr, _ = roc_curve(y_bin, scores)
-                roc_auc = auc(fpr, tpr)
-            except ValueError:
-                continue
-            ax.plot(
-                fpr,
-                tpr,
-                color="black",
-                lw=1.8,
-                ls=":",
-                zorder=10,
-                label=f"Human ({roc_auc:.3f})",
-            )
-            plotted_ovr[ci] = True
-    for run_idx, run in enumerate(prediction_runs):
-        color = cmap(run_idx % 10)
-        built = _agent_y_true_and_prob_matrix_for_run(
-            rows, focals, predictions_root, run
+    with plt.rc_context(
+        {
+            "figure.dpi": ROC_OVR_FIGURE_DPI,
+            "savefig.dpi": ROC_OVR_FIGURE_DPI,
+        },
+    ):
+        fig, axes = plt.subplots(
+            3,
+            1,
+            figsize=(ROC_OVR_FIGSIZE_W_IN, ROC_OVR_FIGSIZE_H_IN),
+            dpi=ROC_OVR_FIGURE_DPI,
+            layout="constrained",
         )
-        if built is None:
-            continue
-        y_true, P = built
-        for ci, _cname in enumerate(GT_CLASSES):
+        cmap = plt.get_cmap("tab10")
+        plotted_ovr = [False, False, False]
+        if built_human is not None:
+            y_true_h, P_h = built_human
+            for ci, _cname in enumerate(GT_CLASSES):
+                ax = axes[ci]
+                y_bin = np.array([1 if yt == GT_CLASSES[ci] else 0 for yt in y_true_h], dtype=np.int32)
+                if np.sum(y_bin) == 0 or np.sum(y_bin) == len(y_bin):
+                    continue
+                scores = P_h[:, ci]
+                try:
+                    fpr, tpr, _ = roc_curve(y_bin, scores)
+                    roc_auc = auc(fpr, tpr)
+                except ValueError:
+                    continue
+                ax.plot(
+                    fpr,
+                    tpr,
+                    color="black",
+                    lw=ROC_OVR_LINEWIDTH,
+                    ls=":",
+                    zorder=10,
+                    label=f"Human ({roc_auc:.3f})",
+                )
+                plotted_ovr[ci] = True
+        for run_idx, run in enumerate(prediction_runs):
+            color = cmap(run_idx % 10)
+            built = _agent_y_true_and_prob_matrix_for_run(
+                rows, focals, predictions_root, run
+            )
+            if built is None:
+                continue
+            y_true, P = built
+            for ci, _cname in enumerate(GT_CLASSES):
+                ax = axes[ci]
+                y_bin = np.array([1 if yt == GT_CLASSES[ci] else 0 for yt in y_true], dtype=np.int32)
+                if np.sum(y_bin) == 0 or np.sum(y_bin) == len(y_bin):
+                    continue
+                scores = P[:, ci]
+                try:
+                    fpr, tpr, _ = roc_curve(y_bin, scores)
+                    roc_auc = auc(fpr, tpr)
+                except ValueError:
+                    continue
+                ax.plot(
+                    fpr,
+                    tpr,
+                    color=color,
+                    lw=ROC_OVR_LINEWIDTH,
+                    zorder=1,
+                    label=f"{run_display_labels[run_idx]} ({roc_auc:.3f})",
+                )
+                plotted_ovr[ci] = True
+        for ci, cname in enumerate(GT_CLASSES):
             ax = axes[ci]
-            y_bin = np.array([1 if yt == GT_CLASSES[ci] else 0 for yt in y_true], dtype=np.int32)
-            if np.sum(y_bin) == 0 or np.sum(y_bin) == len(y_bin):
-                continue
-            scores = P[:, ci]
-            try:
-                fpr, tpr, _ = roc_curve(y_bin, scores)
-                roc_auc = auc(fpr, tpr)
-            except ValueError:
-                continue
-            ax.plot(
-                fpr,
-                tpr,
-                color=color,
-                lw=1.8,
-                zorder=1,
-                label=f"{_abbrev_run_folder(run)} ({roc_auc:.3f})",
+            ax.plot([0, 1], [0, 1], "k:", alpha=0.4, lw=ROC_OVR_DIAG_LINEWIDTH)
+            ax.set_xlim(-0.02, 1.02)
+            ax.set_ylim(-0.02, 1.02)
+            ax.set_xticks(np.arange(0.0, 1.01, 0.1))
+            ax.set_yticks(np.arange(0.0, 1.01, 0.1))
+            ax.set_xlabel("False positive rate", fontsize=ROC_OVR_AXIS_LABEL_FONTSIZE)
+            ax.set_ylabel("True positive rate", fontsize=ROC_OVR_AXIS_LABEL_FONTSIZE)
+            ax.set_title(f'GT class: "{cname}" vs rest', fontsize=ROC_OVR_TITLE_FONTSIZE)
+            ax.tick_params(axis="both", labelsize=ROC_OVR_TICK_FONTSIZE)
+            ax.set_axisbelow(True)
+            ax.grid(
+                True,
+                which="major",
+                linestyle=ROC_OVR_GRID_LINESTYLE,
+                linewidth=ROC_OVR_GRID_LINEWIDTH,
+                color=ROC_OVR_GRID_COLOR,
+                alpha=ROC_OVR_GRID_ALPHA,
             )
-            plotted_ovr[ci] = True
-    for ci, cname in enumerate(GT_CLASSES):
-        ax = axes[ci]
-        ax.plot([0, 1], [0, 1], "k:", alpha=0.35, lw=1)
-        ax.set_xlim(-0.02, 1.02)
-        ax.set_ylim(-0.02, 1.02)
-        ax.set_xlabel("False positive rate")
-        ax.set_ylabel("True positive rate")
-        ax.set_title(f'GT class: "{cname}" vs rest')
-        if plotted_ovr[ci]:
-            ax.legend(fontsize=7, loc="lower right")
-        else:
-            ax.text(
-                0.5,
-                0.5,
-                "No valid OvR ROC\n(both classes needed)",
-                ha="center",
-                va="center",
-                fontsize=9,
-                color="0.35",
+            if plotted_ovr[ci]:
+                ax.legend(
+                    fontsize=ROC_OVR_LEGEND_FONTSIZE,
+                    loc="lower left",
+                    bbox_to_anchor=(1.015, 0),
+                    frameon=False,
+                    handlelength=1.6,
+                    borderaxespad=0.0,
+                )
+            else:
+                ax.text(
+                    0.5,
+                    0.5,
+                    "No valid OvR ROC\n(both classes needed)",
+                    ha="center",
+                    va="center",
+                    fontsize=ROC_OVR_AXIS_LABEL_FONTSIZE,
+                    color="0.35",
+                )
+            ax.set_aspect("equal", adjustable="box")
+        st.pyplot(fig, use_container_width=False)
+        plt.close(fig)
+
+
+def render_fdr_recall_curves_for_runs(
+    *,
+    rows: list[tuple[str, int, str, str]],
+    focals: list[str],
+    predictions_root: Path,
+    prediction_runs: list[str],
+    run_display_labels: list[str],
+    human_probs_path: Path,
+) -> None:
+    """One figure: 3 stacked OvR panels of False Discovery Rate (FDR) vs Recall.
+
+    Mirrors :func:`render_roc_ovr_curves_for_runs` but plots
+    ``FDR = FP / (TP + FP) = 1 − precision`` against ``Recall = TP / (TP + FN)``.
+
+    Each curve is scored on the rows where that predictor has a probability
+    (per-model support); the legend includes ``n=…`` so the support is visible.
+    The dashed horizontal baseline per panel is the random-classifier FDR
+    (= 1 − class prevalence) computed from the pooled evaluation rows; per-model
+    prevalence may differ slightly because of differing supports.
+    """
+    if len(run_display_labels) != len(prediction_runs):
+        run_display_labels = _unique_abbrev_labels_for_runs(prediction_runs)
+    if not rows:
+        return
+    human_probs_by_focal: dict[str, dict[int, dict[str, Any]]] | None = None
+    hp_path = human_probs_path.expanduser().resolve()
+    if hp_path.is_file():
+        human_probs_by_focal = load_human_probs_by_focal_user(str(hp_path))
+    built_human = _human_y_true_and_prob_matrix(rows, human_probs_by_focal)
+    if not prediction_runs and built_human is None:
+        return
+
+    pooled_gt_classes = [g for _f, _t, _tg, g in rows]
+    pooled_n = len(pooled_gt_classes)
+    pooled_prevalence: dict[str, float] = {
+        cname: (pooled_gt_classes.count(cname) / pooled_n if pooled_n else 0.0)
+        for cname in GT_CLASSES
+    }
+
+    st.markdown("##### False discovery rate vs recall (one-vs-rest, probability scores)")
+    st.caption(
+        f"Native canvas ≈ **{ROC_OVR_FIGSIZE_W_IN:.1f} × {ROC_OVR_FIGSIZE_H_IN:.1f}** inches at "
+        f"**{ROC_OVR_FIGURE_DPI:.0f} dpi** → **~"
+        f"{int(ROC_OVR_FIGSIZE_W_IN * ROC_OVR_FIGURE_DPI)} × {int(ROC_OVR_FIGSIZE_H_IN * ROC_OVR_FIGURE_DPI)}** px. "
+        "Each panel is binary “this class vs rest” using **predicted probability for that class**. "
+        "**Recall (x)** = TP / (TP + FN) — fraction of true positives caught. "
+        "**FDR (y)** = FP / (TP + FP) = 1 − precision — fraction of flagged items that are wrong. "
+        "Each curve is computed on **only the rows where that predictor has a probability** "
+        "(its own support; shown as `n=…` in the legend). "
+        "**AP** in the legend = average-precision (PR-AUC). "
+        "Dashed horizontal line per panel = random-classifier FDR baseline = 1 − pooled class prevalence; "
+        "per-model prevalence may differ slightly when supports differ."
+    )
+    if not hp_path.is_file():
+        st.caption(
+            f"Note: human soft-prob file not found at `{hp_path}`; Human FDR–recall track is omitted."
+        )
+    with plt.rc_context(
+        {
+            "figure.dpi": ROC_OVR_FIGURE_DPI,
+            "savefig.dpi": ROC_OVR_FIGURE_DPI,
+        },
+    ):
+        fig, axes = plt.subplots(
+            3,
+            1,
+            figsize=(ROC_OVR_FIGSIZE_W_IN, ROC_OVR_FIGSIZE_H_IN),
+            dpi=ROC_OVR_FIGURE_DPI,
+            layout="constrained",
+        )
+        cmap = plt.get_cmap("tab10")
+        plotted_ovr = [False, False, False]
+
+        if built_human is not None:
+            y_true_h, P_h = built_human
+            n_h = len(y_true_h)
+            for ci, cname in enumerate(GT_CLASSES):
+                ax = axes[ci]
+                y_bin = np.array(
+                    [1 if yt == cname else 0 for yt in y_true_h], dtype=np.int32
+                )
+                pos = int(np.sum(y_bin))
+                if pos == 0 or pos == len(y_bin):
+                    continue
+                scores = P_h[:, ci]
+                try:
+                    precision, recall, _ = precision_recall_curve(y_bin, scores)
+                    ap = average_precision_score(y_bin, scores)
+                except ValueError:
+                    continue
+                fdr = 1.0 - precision
+                ax.plot(
+                    recall,
+                    fdr,
+                    color="black",
+                    lw=ROC_OVR_LINEWIDTH,
+                    ls=":",
+                    zorder=10,
+                    label=f"Human (AP={ap:.3f}, n={n_h})",
+                )
+                plotted_ovr[ci] = True
+
+        for run_idx, run in enumerate(prediction_runs):
+            color = cmap(run_idx % 10)
+            built = _agent_y_true_and_prob_matrix_for_run(
+                rows, focals, predictions_root, run
             )
-        ax.set_aspect("equal", adjustable="box")
-    fig.tight_layout()
-    st.pyplot(fig)
-    plt.close(fig)
+            if built is None:
+                continue
+            y_true, P = built
+            n_run = len(y_true)
+            for ci, cname in enumerate(GT_CLASSES):
+                ax = axes[ci]
+                y_bin = np.array(
+                    [1 if yt == cname else 0 for yt in y_true], dtype=np.int32
+                )
+                pos = int(np.sum(y_bin))
+                if pos == 0 or pos == len(y_bin):
+                    continue
+                scores = P[:, ci]
+                try:
+                    precision, recall, _ = precision_recall_curve(y_bin, scores)
+                    ap = average_precision_score(y_bin, scores)
+                except ValueError:
+                    continue
+                fdr = 1.0 - precision
+                ax.plot(
+                    recall,
+                    fdr,
+                    color=color,
+                    lw=ROC_OVR_LINEWIDTH,
+                    zorder=1,
+                    label=f"{run_display_labels[run_idx]} (AP={ap:.3f}, n={n_run})",
+                )
+                plotted_ovr[ci] = True
+
+        for ci, cname in enumerate(GT_CLASSES):
+            ax = axes[ci]
+            baseline_fdr = 1.0 - pooled_prevalence[cname]
+            ax.axhline(
+                baseline_fdr,
+                color="0.4",
+                lw=ROC_OVR_DIAG_LINEWIDTH,
+                ls="--",
+                alpha=0.6,
+            )
+            ax.set_xlim(-0.02, 1.02)
+            ax.set_ylim(-0.02, 1.02)
+            ax.set_xticks(np.arange(0.0, 1.01, 0.1))
+            ax.set_yticks(np.arange(0.0, 1.01, 0.1))
+            ax.set_xlabel("Recall (TPR)", fontsize=ROC_OVR_AXIS_LABEL_FONTSIZE)
+            ax.set_ylabel("False discovery rate", fontsize=ROC_OVR_AXIS_LABEL_FONTSIZE)
+            ax.set_title(
+                f'GT class: "{cname}" vs rest (baseline FDR={baseline_fdr:.2f})',
+                fontsize=ROC_OVR_TITLE_FONTSIZE,
+            )
+            ax.tick_params(axis="both", labelsize=ROC_OVR_TICK_FONTSIZE)
+            ax.set_axisbelow(True)
+            ax.grid(
+                True,
+                which="major",
+                linestyle=ROC_OVR_GRID_LINESTYLE,
+                linewidth=ROC_OVR_GRID_LINEWIDTH,
+                color=ROC_OVR_GRID_COLOR,
+                alpha=ROC_OVR_GRID_ALPHA,
+            )
+            if plotted_ovr[ci]:
+                ax.legend(
+                    fontsize=ROC_OVR_LEGEND_FONTSIZE,
+                    loc="lower left",
+                    bbox_to_anchor=(1.015, 0),
+                    frameon=False,
+                    handlelength=1.6,
+                    borderaxespad=0.0,
+                )
+            else:
+                ax.text(
+                    0.5,
+                    0.5,
+                    "No valid OvR PR\n(both classes needed)",
+                    ha="center",
+                    va="center",
+                    fontsize=ROC_OVR_AXIS_LABEL_FONTSIZE,
+                    color="0.35",
+                )
+            ax.set_aspect("equal", adjustable="box")
+        st.pyplot(fig, use_container_width=False)
+        plt.close(fig)
 
 
 def build_evaluation_rows_for_scope(
     clean_labels_dir: Path,
     focal_users: list[str],
     visible_ids_by_user: dict[str, set[str]],
-) -> list[tuple[str, int, str]]:
-    """(focal, tweet_id, gt_class) for items in-scope with usable GT."""
-    rows: list[tuple[str, int, str]] = []
+) -> list[tuple[str, int, str, str]]:
+    """(focal, tweet_id, target_entity, gt_class) for items in-scope with usable GT.
+
+    Iterates ``clean_labels`` keyed by ``(tid, target_entity)`` so multi-target tweets
+    are not silently collapsed. ``visible_ids_by_user`` is per-tid (= the set of tids
+    in that focal's labeling pool); every (tid, target) clean-label row whose tid is in
+    scope is included, even if only one of the targets was actually shown to the human
+    labeler. Per-model support naturally drops back when a predictor has no record for
+    a given (tid, target).
+    """
+    rows: list[tuple[str, int, str, str]] = []
     for focal in focal_users:
-        by_tid = load_clean_label_items_by_tweet_id(
+        by_key = load_clean_label_items_by_key(
             str(clean_labels_dir.resolve()), focal
         )
         visible = visible_ids_by_user.get(focal, set())
-        for tid, rec in by_tid.items():
+        for (tid, target), rec in by_key.items():
             if str(tid) not in visible:
                 continue
             gt = _normalize_gt_label(rec.get("ground_truth_label"))
             if gt is None:
                 continue
-            rows.append((focal, int(tid), gt))
+            rows.append((focal, int(tid), target, gt))
     return rows
 
 
@@ -736,17 +1190,28 @@ def render_review_performance(
     visible_ids_by_user: dict[str, set[str]],
     labels_by_user: dict[str, dict[str, dict[str, Any]]],
     prediction_runs: list[str],
+    run_display_labels: list[str],
     human_probs_path: Path = DEFAULT_HUMAN_PROBS_JSON,
 ) -> None:
     """Aggregate metrics vs clean_labels GT; confusion matrices per human / agent run."""
+    if len(run_display_labels) != len(prediction_runs):
+        run_display_labels = _unique_abbrev_labels_for_runs(prediction_runs)
     st.subheader("Performance vs ground truth (`clean_labels`)")
     st.caption(
         "GT = **ground_truth_label** (endorsing / disendorsing / neutral). "
+        "**Eval rows are keyed by `(representative_tweet_id, target_entity)`** — multi-target "
+        "tweets contribute one row per target; predictions are matched per target so a "
+        "tweet's GT row is never paired with another target's score. "
         "Agents: argmax(**p_endorsing**, **p_disendorsing**, **p_neutral**). "
-        "**Human**: mapped label (**wrong_target** excluded). "
+        "**Human** classification: **label** from ``predictions_top5_jul2024_human_probs.json`` "
+        "(**wrong_target** excluded). **Human Brier / skill**: soft "
+        "**prob_endorse / prob_disendorse / prob_neutral** from that file only; "
+        "evaluation rows without all three probs are dropped from the Human row. "
         "**Brier** mean (1/3)∑ᵢ(pᵢ−target)² per row; "
         "**Brier marginal** = same metric if every row predicted the GT class-frequency vector; "
-        "**Brier skill** = 1 − Brier/Brierₘ."
+        "**Brier skill** = 1 − Brier/Brierₘ. **Weighted AUROC** = sklearn OvR ROC AUC per "
+        "class, averaged with weights = **GT counts per class / n** (more frequent "
+        "classes count more)."
     )
 
     scope = st.radio(
@@ -779,65 +1244,110 @@ def render_review_performance(
 
     st.caption(f"**{len(rows)}** items with usable GT after filtering to labeling scope.")
 
-    # --- Human ---
-    yt_h: list[str] = []
-    yp_h: list[str] = []
-    pr_h: list[list[float]] = []
-    for focal, tid, gt in rows:
-        rec = labels_by_user.get(focal, {}).get(str(tid))
-        raw = rec.get("label") if rec else None
-        hc = human_label_to_gt_class(raw)
-        if hc is None:
-            continue
-        yt_h.append(gt)
-        yp_h.append(hc)
-        pr_h.append(list(_one_hot(hc)))
+    hp_path = human_probs_path.expanduser().resolve()
+    human_probs_by_focal: dict[str, dict[int, dict[str, Any]]] = {}
+    if hp_path.is_file():
+        human_probs_by_focal = load_human_probs_by_focal_user(str(hp_path))
+    else:
+        st.warning(
+            f"Human probability metrics need soft labels at `{hp_path}` (missing). "
+            "Human row in the summary is omitted until that file exists."
+        )
+
+    yt_h, yp_h, pr_h = _human_gt_pred_probs_soft_only(rows, human_probs_by_focal, None)
+    if hp_path.is_file() and not yt_h and rows:
+        st.info(
+            "No evaluation rows overlap **predictions_top5_jul2024_human_probs.json** with "
+            "all three `prob_*` fields; Human summary metrics are empty for this slice."
+        )
 
     human_row = _metrics_from_predictions(yt_h, yp_h, pr_h) if yt_h else None
+    if yt_h and len(yt_h) < len(rows):
+        st.caption(
+            f"**Human** summary uses **{len(yt_h)}** rows with all three `prob_*` fields in "
+            f"`predictions_top5_jul2024_human_probs.json` (of **{len(rows)}** GT rows here). "
+            "Agent rows still use every prediction that overlaps the slice."
+        )
 
     metric_rows: list[dict[str, Any]] = []
-    if human_row:
+    if human_row and int(human_row.get("support") or 0) > 0:
         mr = dict(human_row)
         mr["model"] = "Human"
         metric_rows.append(mr)
 
-    for run in prediction_runs:
-        pmap_by_focal: dict[str, dict[int, dict[str, Any]]] = {}
+    active_prediction_runs: list[str] = []
+    active_run_display_labels: list[str] = []
+    for i, run in enumerate(prediction_runs):
+        pmap_by_focal: dict[str, dict[EvalKey, dict[str, Any]]] = {}
         for fu in focals:
-            pmap_by_focal[fu] = load_agent_predictions_by_tweet_id(
+            pmap_by_focal[fu] = load_agent_predictions_by_key(
                 str((predictions_root / run / f"predictions_{fu}.json").resolve())
             )
         yt_v: list[str] = []
         yp_v: list[str] = []
         prv: list[list[float]] = []
-        for focal, tid, gt in rows:
-            pr = pmap_by_focal.get(focal, {}).get(int(tid))
+        for focal, tid, target, gt in rows:
+            pr = pmap_by_focal.get(focal, {}).get((int(tid), target))
             if pr is None:
                 continue
             yt_v.append(gt)
             yp_v.append(_agent_prediction_argmax_label(pr))
             prv.append(_pred_prob_vec_ordered(pr))
         rdict = _metrics_from_predictions(yt_v, yp_v, prv)
-        rdict["model"] = _abbrev_run_folder(run)
+        if int(rdict.get("support") or 0) == 0:
+            continue
+        rdict["model"] = run_display_labels[i]
         metric_rows.append(rdict)
+        active_prediction_runs.append(run)
+        active_run_display_labels.append(run_display_labels[i])
+
+    n_excluded_support0 = len(prediction_runs) - len(active_prediction_runs)
+    if n_excluded_support0 > 0:
+        st.caption(
+            f"Excluded **{n_excluded_support0}** agent run(s) with support 0 "
+            "(no overlapping predictions vs GT for this evaluation slice)."
+        )
 
     if metric_rows:
         dfm = pd.DataFrame(metric_rows)
-        front = ["model"]
-        rest = [
-            c
-            for c in dfm.columns
-            if c not in front
+        _summary_metric_col_order = [
+            "model",
+            "accuracy",
+            "brier_skill",
+            "weighted_auroc",
+            "weighted_f1",
+            "macro_f1",
+            "f1_endorsing",
+            "f1_disendorsing",
+            "f1_neutral",
+            "brier",
+            "brier_marginal",
+            "support",
         ]
-        dfm = dfm[front + rest]
+        cols_ordered = [c for c in _summary_metric_col_order if c in dfm.columns]
+        leftover = [c for c in dfm.columns if c not in cols_ordered]
+        dfm = dfm[cols_ordered + leftover]
         st.markdown("##### Summary metrics")
+        st.caption(
+            "**Bold** = best value in that column (accuracy / Brier skill / weighted AUROC / F1: higher; "
+            "Brier & marginal baseline Brier: lower). **Support** is not ranked."
+        )
+
+        bold_summary_internal = _summary_metrics_bold_mask(dfm)
 
         display = dfm.copy()
 
         display["accuracy"] = display["accuracy"].map(
             lambda v: f"{v * 100:.2f}%" if v == v else "—"
         )
-        for c in ["weighted_f1", "macro_f1", "f1_endorsing", "f1_disendorsing", "f1_neutral"]:
+        for c in [
+            "weighted_auroc",
+            "weighted_f1",
+            "macro_f1",
+            "f1_endorsing",
+            "f1_disendorsing",
+            "f1_neutral",
+        ]:
             display[c] = display[c].map(lambda v: f"{v:.4f}" if v == v else "—")
 
         display["brier"] = display["brier"].map(lambda v: f"{v:.4f}" if v == v else "—")
@@ -860,6 +1370,7 @@ def render_review_performance(
         rename = {
             "model": "Predictor",
             "accuracy": "Accuracy",
+            "weighted_auroc": "Weighted AUROC",
             "weighted_f1": "Weighted F1",
             "macro_f1": "Macro F1",
             "f1_endorsing": "F₁ endorsing",
@@ -871,8 +1382,12 @@ def render_review_performance(
             "support": "Support (n)",
         }
         display = display.rename(columns=rename)
+        bold_summary_display = bold_summary_internal.rename(columns=rename)
 
-        st.dataframe(display, use_container_width=True, hide_index=True)
+        styled_summary = display.style.apply(
+            _styler_css_bold(bold_summary_display), axis=None
+        )
+        st.dataframe(styled_summary, use_container_width=True, hide_index=True)
     else:
         st.info(
             "No overlapping predictions to score (human had no usable labels and/or "
@@ -880,7 +1395,7 @@ def render_review_performance(
         )
 
     # --- Focal × model: Brier skill matrix ----------------------------------
-    if prediction_runs and rows:
+    if rows and (yt_h or active_prediction_runs):
 
         def _fmt_skill_cell(m: dict[str, Any] | None) -> str:
             if m is None:
@@ -895,35 +1410,24 @@ def render_review_performance(
             return f"{x:.4f}"
 
         def _human_metrics_focal(fu: str) -> dict[str, Any] | None:
-            yt_h: list[str] = []
-            yp_h: list[str] = []
-            pr_h: list[list[float]] = []
-            for focal, tid, gt in rows:
-                if focal != fu:
-                    continue
-                rec = labels_by_user.get(focal, {}).get(str(tid))
-                raw = rec.get("label") if rec else None
-                hc = human_label_to_gt_class(raw)
-                if hc is None:
-                    continue
-                yt_h.append(gt)
-                yp_h.append(hc)
-                pr_h.append(list(_one_hot(hc)))
-            if not yt_h:
+            yt_f, yp_f, pr_f = _human_gt_pred_probs_soft_only(
+                rows, human_probs_by_focal, focal_filter=fu
+            )
+            if not yt_f:
                 return None
-            return _metrics_from_predictions(yt_h, yp_h, pr_h)
+            return _metrics_from_predictions(yt_f, yp_f, pr_f)
 
         def _agent_metrics_focal(fu: str, run: str) -> dict[str, Any] | None:
-            pmap = load_agent_predictions_by_tweet_id(
+            pmap = load_agent_predictions_by_key(
                 str((predictions_root / run / f"predictions_{fu}.json").resolve())
             )
             yt_v: list[str] = []
             yp_v: list[str] = []
             prv: list[list[float]] = []
-            for focal, tid, gt in rows:
+            for focal, tid, target, gt in rows:
                 if focal != fu:
                     continue
-                pr = pmap.get(int(tid))
+                pr = pmap.get((int(tid), target))
                 if pr is None:
                     continue
                 yt_v.append(gt)
@@ -934,61 +1438,92 @@ def render_review_performance(
             return _metrics_from_predictions(yt_v, yp_v, prv)
 
         idx = list(focals)
-        col_models = ["Human"] + [_abbrev_run_folder(r) for r in prediction_runs]
-        skill_grid: list[list[str]] = []
+        col_models: list[str] = []
+        if yt_h:
+            col_models.append("Human")
+        col_models.extend(active_run_display_labels)
+        skill_fmt: list[list[str]] = []
+        skill_num: list[list[float]] = []
         for fu in idx:
-            skill_row = [_fmt_skill_cell(_human_metrics_focal(fu))]
-            for run in prediction_runs:
-                skill_row.append(_fmt_skill_cell(_agent_metrics_focal(fu, run)))
-            skill_grid.append(skill_row)
+            fmt_row: list[str] = []
+            num_row: list[float] = []
+            if yt_h:
+                hm = _human_metrics_focal(fu)
+                num_row.append(_brier_skill_float_from_metrics(hm))
+                fmt_row.append(_fmt_skill_cell(hm))
+            for run in active_prediction_runs:
+                am = _agent_metrics_focal(fu, run)
+                num_row.append(_brier_skill_float_from_metrics(am))
+                fmt_row.append(_fmt_skill_cell(am))
+            skill_fmt.append(fmt_row)
+            skill_num.append(num_row)
 
-        df_skill = pd.DataFrame(skill_grid, index=idx, columns=col_models)
+        df_skill = pd.DataFrame(skill_fmt, index=idx, columns=col_models)
+        df_skill_num = pd.DataFrame(skill_num, index=idx, columns=col_models)
         df_skill.index.name = "Focal user"
+        bold_skill_inner = _skill_grid_row_best_mask(df_skill_num)
+
+        ds_skill = df_skill.reset_index()
+        bold_skill_pad = pd.DataFrame(False, index=ds_skill.index, columns=ds_skill.columns)
+        focal_col = ds_skill.columns[0]
+        bold_skill_pad[focal_col] = False
+        for j, cm in enumerate(col_models):
+            bold_skill_pad[cm] = bold_skill_inner[cm].values
+
         st.markdown("##### Focal user × model: Brier skill vs marginal")
         st.caption(
-            "Rows = focal users in this evaluation slice; columns = Human + each agent run. "
+            "Rows = focal users in this evaluation slice; columns = Human (if any) + each "
+            "agent run with non-zero support on this slice. "
             "Each cell is Brier skill vs marginal on that focal subset only "
-            "(same definition as summary; Human = one-hot labels). "
-            "— means no overlapping usable GT rows for that cell."
+            "(same definition as summary; Human = soft probs from human_probs JSON only). "
+            "— means no overlapping usable GT rows for that cell. "
+            "**Bold** = highest skill in that row (same focal; ties bold together)."
         )
-        st.dataframe(
-            df_skill.reset_index(),
-            use_container_width=True,
-            hide_index=True,
+        styled_skill = ds_skill.style.apply(
+            _styler_css_bold(bold_skill_pad), axis=None
         )
+        st.dataframe(styled_skill, use_container_width=True, hide_index=True)
 
     if rows:
         render_roc_ovr_curves_for_runs(
             rows=rows,
             focals=list(focals),
             predictions_root=predictions_root,
-            prediction_runs=prediction_runs,
-            labels_by_user=labels_by_user,
+            prediction_runs=active_prediction_runs,
+            run_display_labels=active_run_display_labels,
+            human_probs_path=human_probs_path,
+        )
+        render_fdr_recall_curves_for_runs(
+            rows=rows,
+            focals=list(focals),
+            predictions_root=predictions_root,
+            prediction_runs=active_prediction_runs,
+            run_display_labels=active_run_display_labels,
             human_probs_path=human_probs_path,
         )
 
     st.markdown("##### Confusion matrices (rows = GT, columns = predicted)")
     if yt_h:
-        with st.expander("Human", expanded=len(prediction_runs) == 0):
+        with st.expander("Human", expanded=not active_prediction_runs):
             st.dataframe(_confusion_df(yt_h, yp_h), use_container_width=True)
 
-    for run in prediction_runs:
-        pmap_by_focal_cm: dict[str, dict[int, dict[str, Any]]] = {}
+    for i, run in enumerate(active_prediction_runs):
+        pmap_by_focal_cm: dict[str, dict[EvalKey, dict[str, Any]]] = {}
         for fu in focals:
-            pmap_by_focal_cm[fu] = load_agent_predictions_by_tweet_id(
+            pmap_by_focal_cm[fu] = load_agent_predictions_by_key(
                 str((predictions_root / run / f"predictions_{fu}.json").resolve())
             )
         yt_c: list[str] = []
         yp_c: list[str] = []
-        for focal, tid, gt in rows:
-            pr = pmap_by_focal_cm.get(focal, {}).get(int(tid))
+        for focal, tid, target, gt in rows:
+            pr = pmap_by_focal_cm.get(focal, {}).get((int(tid), target))
             if pr is None:
                 continue
             yt_c.append(gt)
             yp_c.append(_agent_prediction_argmax_label(pr))
         if not yt_c:
             continue
-        with st.expander(_abbrev_run_folder(run), expanded=False):
+        with st.expander(active_run_display_labels[i], expanded=False):
             st.dataframe(_confusion_df(yt_c, yp_c), use_container_width=True)
 
 
@@ -1269,15 +1804,17 @@ def render_card(
     output_path: Path,
     visible_ids_by_user: dict[str, set[str]],
     review_mode: bool,
-    clean_by_tid: dict[int, dict[str, Any]],
+    clean_by_key: dict[EvalKey, dict[str, Any]],
     prediction_runs: list[str],
-    pred_by_run: dict[str, dict[int, dict[str, Any]]],
+    run_display_labels: list[str],
+    pred_by_run: dict[str, dict[EvalKey, dict[str, Any]]],
 ) -> None:
     target = item.get("target_entity") or "(no target_entity)"
     longer = item.get("longer_name") or ""
     url = item.get("url") or ""
     tid = item["representative_tweet_id"]
     confidence_key = f"conf_{focal}_{tid}"
+    item_key: EvalKey = (int(tid), str(item.get("target_entity") or ""))
 
     with st.container(border=True):
         st.markdown(f"### {idx}. {target}")
@@ -1287,14 +1824,14 @@ def render_card(
             st.markdown(f"**URL:** {url}")
 
         if review_mode:
-            tid_i = int(tid)
-            clean_rec = clean_by_tid.get(tid_i)
+            clean_rec = clean_by_key.get(item_key)
             _review_comparison_md_row(
                 clean_rec=clean_rec,
                 human_label=current_label,
                 prediction_runs=prediction_runs,
+                run_display_labels=run_display_labels,
                 pred_by_run=pred_by_run,
-                tid_i=tid_i,
+                eval_key=item_key,
             )
             st.caption(
                 f"{EMOJI_ENDORSING} endorsing · {EMOJI_NEUTRAL} neutral · "
@@ -1317,18 +1854,17 @@ def render_card(
             else:
                 st.warning("No row in clean_labels for this tweet id.")
 
-            for run in prediction_runs:
-                pr = pred_by_run.get(run, {}).get(tid_i)
-                title = _abbrev_run_folder(run, max_len=64)
+            for display_label, run in zip(run_display_labels, prediction_runs, strict=True):
+                pr = pred_by_run.get(run, {}).get(item_key)
+                if not pr:
+                    continue
+                title = _truncate_display(display_label)
                 with st.expander(f"{title} — probs & reasoning", expanded=False):
-                    if not pr:
-                        st.caption("_No prediction for this id in this run._")
-                    else:
-                        st.markdown(
-                            f"**Argmax:** `{_agent_prediction_argmax_label(pr)}`  \n"
-                            f"**Probs:** {_format_agent_probs(pr)}"
-                        )
-                        st.markdown(f"**Reasoning:** {pr.get('reasoning') or '—'}")
+                    st.markdown(
+                        f"**Argmax:** `{_agent_prediction_argmax_label(pr)}`  \n"
+                        f"**Probs:** {_format_agent_probs(pr)}"
+                    )
+                    st.markdown(f"**Reasoning:** {pr.get('reasoning') or '—'}")
 
             st.markdown("##### Your human label (read-only)")
             if current_label:
@@ -1409,9 +1945,10 @@ def _render_browse_item_page(
     items_per_page: int,
     labels_by_user: dict[str, dict[str, dict[str, Any]]],
     review_mode: bool,
-    clean_by_tid: dict[int, dict[str, Any]],
+    clean_by_key: dict[EvalKey, dict[str, Any]],
     prediction_runs: list[str],
-    pred_by_run: dict[str, dict[int, dict[str, Any]]],
+    run_display_labels: list[str],
+    pred_by_run: dict[str, dict[EvalKey, dict[str, Any]]],
 ) -> None:
     """Paging + filtered item cards for the current focal."""
     if total == 0:
@@ -1480,14 +2017,19 @@ def _render_browse_item_page(
             output_path=output_path,
             visible_ids_by_user=visible_ids_by_user,
             review_mode=review_mode,
-            clean_by_tid=clean_by_tid,
+            clean_by_key=clean_by_key,
             prediction_runs=prediction_runs,
+            run_display_labels=run_display_labels,
             pred_by_run=pred_by_run,
         )
 
 
 def main() -> None:
-    st.set_page_config(page_title="Endorsement target labeler", layout="wide")
+    st.set_page_config(
+        page_title="Endorsement target labeler",
+        layout="wide",
+        initial_sidebar_state="collapsed",
+    )
     st.title("Endorsement target labeler — top 5 + neighbors (Jul 2024)")
 
     # --- Sidebar: file paths ------------------------------------------------
@@ -1575,7 +2117,7 @@ def main() -> None:
     st.sidebar.subheader("Review mode")
     review_mode = st.sidebar.checkbox(
         "Show ground truth & model predictions (read-only)",
-        value=False,
+        value=True,
         help=(
             "Shows rows from `clean_labels/`, a compact comparison table of "
             "ground truth / human / each agent run folder under "
@@ -1585,8 +2127,8 @@ def main() -> None:
         ),
     )
     prediction_runs: list[str] = []
-    clean_by_tid: dict[int, dict[str, Any]] = {}
-    pred_by_run: dict[str, dict[int, dict[str, Any]]] = {}
+    clean_by_key: dict[EvalKey, dict[str, Any]] = {}
+    pred_by_run: dict[str, dict[EvalKey, dict[str, Any]]] = {}
     if review_mode:
         prediction_runs = all_cursor_run_folders
         if all_cursor_run_folders:
@@ -1594,7 +2136,7 @@ def main() -> None:
                 f"Using **{len(all_cursor_run_folders)}** run folder(s) under "
                 "`cursor_agent_predictions/` (one column per folder, newest first)."
             )
-        clean_by_tid = load_clean_label_items_by_tweet_id(
+        clean_by_key = load_clean_label_items_by_key(
             str(DEFAULT_CLEAN_LABELS_DIR.resolve()), focal
         )
         gt_clean_path = DEFAULT_CLEAN_LABELS_DIR / f"ground_truth_{focal}.json"
@@ -1608,13 +2150,15 @@ def main() -> None:
         else:
             for run in prediction_runs:
                 pred_path = CURSOR_PREDICTIONS_DIR / run / f"predictions_{focal}.json"
-                pred_by_run[run] = load_agent_predictions_by_tweet_id(
+                pred_by_run[run] = load_agent_predictions_by_key(
                     str(pred_path.resolve())
                 )
                 if not pred_path.exists():
                     st.sidebar.warning(
                         f"Missing file for this focal user: `{pred_path.name}` in `{run}`"
                     )
+
+    run_display_labels = _unique_abbrev_labels_for_runs(prediction_runs)
 
     items = items_by_focal[focal]
     total = len(items)
@@ -1706,13 +2250,15 @@ def main() -> None:
     # --- Main pane ----------------------------------------------------------
     if review_mode:
         st.info(
-            "**Review mode:** compact **GT / Human / models** table "
+            "**Review mode:** **Aggregate metrics** (default tab) has accuracy / Brier skill / "
+            "weighted AUROC / F1 / Brier vs marginal baseline / one-vs-rest **ROC** + "
+            "**FDR–recall** curves (each scored on that model's own support); "
+            "**Browse items** shows the compact **GT / Human / models** table "
             f"({EMOJI_ENDORSING} endorsing · {EMOJI_NEUTRAL} neutral · "
             f"{EMOJI_DISENDORING} disendorsing; {EMOJI_HUMAN_WRONG_TARGET} human wrong "
-            "target), then details. Labeling controls are hidden. "
-            "Open **Aggregate metrics** for accuracy / F1 / Brier vs marginal baseline."
+            "target), then details. Labeling controls are hidden."
         )
-        browse_tab, metrics_tab = st.tabs(["Browse items", "Aggregate metrics"])
+        metrics_tab, browse_tab = st.tabs(["Aggregate metrics", "Browse items"])
         with metrics_tab:
             render_review_performance(
                 clean_labels_dir=DEFAULT_CLEAN_LABELS_DIR.resolve(),
@@ -1721,6 +2267,7 @@ def main() -> None:
                 visible_ids_by_user=visible_ids_by_user,
                 labels_by_user=labels_by_user,
                 prediction_runs=prediction_runs,
+                run_display_labels=run_display_labels,
             )
         with browse_tab:
             _render_browse_item_page(
@@ -1735,8 +2282,9 @@ def main() -> None:
                 items_per_page=items_per_page,
                 labels_by_user=labels_by_user,
                 review_mode=review_mode,
-                clean_by_tid=clean_by_tid,
+                clean_by_key=clean_by_key,
                 prediction_runs=prediction_runs,
+                run_display_labels=run_display_labels,
                 pred_by_run=pred_by_run,
             )
         return
@@ -1766,8 +2314,9 @@ def main() -> None:
         items_per_page=items_per_page,
         labels_by_user=labels_by_user,
         review_mode=review_mode,
-        clean_by_tid=clean_by_tid,
+        clean_by_key=clean_by_key,
         prediction_runs=prediction_runs,
+        run_display_labels=run_display_labels,
         pred_by_run=pred_by_run,
     )
 

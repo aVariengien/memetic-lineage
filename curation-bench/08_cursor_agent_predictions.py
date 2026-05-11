@@ -83,121 +83,126 @@ def strip_ground_truth(data: dict) -> dict:
 
 def build_agent_prompt(focal_user: str, n_items: int) -> str:
     return f"""\
-You are analyzing the Twitter/X archive of @{focal_user} to predict whether they would endorse, disendorse, or be neutral toward {n_items} named entities during July 2024.
+You are analyzing the Twitter/X archive of @{focal_user} (data ends 2024-07-01) to predict the label for {n_items} (representative_tweet_id, target_entity) pairs from July 2024.
 
-Your primary objective is calibrated probability forecasting. The scoring metric is Brier skill score against a constant class-frequency baseline, so a weak clue should only move probabilities slightly. Top-1 accuracy is secondary.
+You are in autonomous agent mode — no user is available to answer questions or validate intermediate decisions. Carry out the task to completion in one shot.
+
+## How the labels are produced — read carefully, this IS the task
+
+Each item points at a `representative_tweet_id` that sits inside a July 2024 conversation path. An external LLM read that path and decided someone in it endorsed (or disendorsed) the target entity.
+
+The ground-truth label is determined entirely by **who authored that representative tweet**:
+
+- If `@{focal_user}` themselves authored the representative tweet → label is `endorsing` or `disendorsing` (the direction the LLM extracted).
+- If anyone else (a neighbor in @{focal_user}'s social graph) authored it → label is `neutral`.
+
+You DO NOT see who authored the representative tweet — that field is stripped. Your real job is to estimate, from the archive alone, the probability that @{focal_user} is the author.
+
+This is **not a preference task**. @{focal_user} may genuinely love a target, but if a neighbor wrote the rep tweet about it, the label is `neutral`. Likewise, @{focal_user} may have authored a brand-new endorsement of something never mentioned in their archive — the label is still `endorsing`. Do not confuse "user likes X" with "user authored the rep tweet about X".
 
 ## Files Available
 
-- `archive/` — @{focal_user}'s Twitter/X archive up to the cutoff. The archive may not contain July 2024 target tweets. Use it only as pre-cutoff evidence about the user's tastes, values, prior endorsements, dislikes, and recurring communities.
-- `endorsement_targets.json` — the entities to predict.
-- `endorsement_prompt.md` — the exact standard for what counts as endorsement or disendorsement.
+- `archive/` — @{focal_user}'s pre-cutoff conversation trees (year/month folders). Use it to learn the user's voice, recurring obsessions, idiosyncratic vocabulary, recommendation habits, and the cast of accounts they typically talk to / amplify.
+- `endorsement_targets.json` — the items to predict, with fields `representative_tweet_id`, `target_entity`, `longer_name`, `url`, `path_anchor_tweet_id`.
+- `endorsement_prompt.md` — the standard the external LLM used to decide what qualifies as endorsement / disendorsement.
+
+The archive ends before the prediction window. This is by design: the benchmark is an **extrapolation** problem. The archive cannot directly tell you what @{focal_user} tweeted in July 2024. It can only tell you what kind of person they are, what they originate vs amplify, and whose voice this target most likely belongs to.
 
 Do not use the web. Do not access files outside this workspace.
 
-## Critical Dataset Fact
+## Mental decomposition
 
-The target list is not a random set of objects. Many neutral examples are entities endorsed or disendorsed by people in @{focal_user}'s social neighborhood, not by @{focal_user}. Therefore:
+For each item, decompose:
 
-- A target being interesting, niche, socially adjacent, or “the kind of thing this user might like” is weak evidence only.
-- A target appearing in a nearby community is not enough to predict endorsement.
-- Neutral is the default even for plausible-looking targets.
+  p_focal_authored ≡ P(the rep_tweet was authored by @{focal_user})
+  p_endorsing_given_focal   ≈ 0.90    (most extracted directions are endorsing)
+  p_disendorsing_given_focal ≈ 0.10
 
-## Base Rates
+Then:
+  p_endorsing    = p_focal_authored * p_endorsing_given_focal
+  p_disendorsing = p_focal_authored * p_disendorsing_given_focal
+  p_neutral      = 1 - p_endorsing - p_disendorsing
 
-Start each item from approximately:
+If there is item-specific evidence that @{focal_user} dislikes this target (warning, complaint, durable rejection of it or a close category), shift `p_disendorsing_given_focal` upward — typically 0.4 to 0.7 — and recompute. Otherwise keep it near 0.10.
 
-- `p_neutral = 0.80`
-- `p_endorsing = 0.18`
-- `p_disendorsing = 0.02`
+This decomposition is mandatory thinking even if you only output the three probabilities. It forces you to focus on the authorship question, which is what the label tracks.
 
-Disendorsement is very rare. Keep `p_disendorsing` near `0.01-0.03` unless there is specific evidence that @{focal_user} dislikes this target or closely similar targets.
+## Base rate
 
-## Evidence Strength Bands
+Across the dataset, roughly 80% of items are non-focal-authored. With no information:
 
-Use these bands to stay calibrated:
+  p_focal_authored ≈ 0.20
+  → p_neutral ≈ 0.80, p_endorsing ≈ 0.18, p_disendorsing ≈ 0.02
 
-### No evidence or only social-neighborhood plausibility
-Use about:
-- `p_neutral = 0.80-0.88`
-- `p_endorsing = 0.10-0.18`
-- `p_disendorsing = 0.01-0.03`
+The Brier skill score is computed against exactly this baseline. Predicting the base rate everywhere gives a skill score of zero. To beat zero you must commit to deviations where you have signal. **Do not retreat to the base rate "to be safe"** — that is precisely the zero-skill policy.
 
-This includes targets that merely match the user's broad interests, friends, subculture, aesthetics, or common topics.
+## What is signal for `p_focal_authored`?
 
-### Weak topical fit
-Use about:
-- `p_neutral = 0.70-0.80`
-- `p_endorsing = 0.18-0.28`
-- `p_disendorsing = 0.01-0.04`
+### Strong push toward focal-authored (p_focal_authored 0.45 – 0.75)
+- The target appears **by name or close alias** in @{focal_user}'s archive as something they themselves brought up evaluatively ("I love X", "X is great", "you should read X"). Not "X was mentioned in a thread they replied to" — they originated the evaluation.
+- The target sits inside @{focal_user}'s **idiosyncratic voice**: a niche / vocabulary / aesthetic they themselves bring up unprompted across the archive, not just things their tribe talks about.
+- The user has a documented habit of producing exactly this kind of recommendation (e.g. a years-long pattern of rating reality shows, naming programming tools, recommending Buddhist books, etc.) and the target fits that habit.
+- The target is so specific to the user's known niche that a neighbor would be unlikely to bring it up in @{focal_user}'s mentions.
 
-Example: the user often discusses Buddhism, films, AI, books, or local events, and the target is in that domain, but you found no target-specific evidence.
+### Weak update only (p_focal_authored 0.18 – 0.30)
+- The target is broadly popular within @{focal_user}'s social tribe (e.g. canonical SSC/ACX posts, Claude/Anthropic, common LessWrong / TPOT / tech-twitter references). These are *exactly* the things neighbors quote at the user — so high tribe-fit is **not** evidence of focal authorship.
+- The target is in the user's broad domain (films, books, AI, etc.) but you have no archive evidence of the user themselves naming it or a close analogue.
+- The target appears in the archive only inside RTs or replies-to others, never as something the user originated.
 
-### Moderate evidence
-Use about:
-- `p_neutral = 0.50-0.70`
-- `p_endorsing = 0.28-0.48`
-- `p_disendorsing = 0.02-0.08`
-
-Example: the target or close aliases appear in the archive, or the user has repeatedly praised a very similar author/project/category, but you do not have a clear prior endorsement of this exact target.
-
-### Strong endorsement evidence
-Use about:
-- `p_neutral = 0.20-0.45`
-- `p_endorsing = 0.50-0.75`
-- `p_disendorsing = 0.01-0.06`
-
-Use this only when the archive shows clear positive evaluation, recommendation, repeated use, affection, or durable praise for this exact target or a near-identical alias.
-
-### Strong disendorsement evidence
-Use about:
-- `p_neutral = 0.35-0.65`
-- `p_endorsing = 0.02-0.15`
-- `p_disendorsing = 0.25-0.55`
-
-Use this only for clear dislike, warning, complaint, boredom, rejection, or durable negative stance by @{focal_user}. Do not infer disendorsement from absence of interest.
+### Counter-signal — push toward neighbor-authored (p_focal_authored 0.05 – 0.18)
+- You can name a specific neighbor whose niche/voice this target obviously belongs to, more than to @{focal_user}.
+- The target is the kind of viral / community content the user typically *receives* rather than originates.
 
 ## Workflow
 
-1. Read `endorsement_prompt.md` first. Use its strict definition of endorsement/disendorsement.
-2. Read the structure of `endorsement_targets.json`.
-3. Build a short profile of @{focal_user} from the archive:
-   - repeated interests
-   - things they clearly recommend
-   - things they clearly dislike
-   - how strong their language tends to be
-   - domains where they often post thin reactions that should not count as durable endorsement
-4. For each target:
-   - Search exact `target_entity`, `longer_name`, obvious aliases, URLs, author names, and title fragments.
-   - Treat exact or alias evidence as much stronger than broad topic fit.
-   - If nothing is found, use the base rate or weak topical-fit band, not a high-confidence guess.
-   - Ask: “Would I expect @{focal_user}, not someone adjacent to them, to still recommend or warn against this named thing months later?”
-5. Before writing the final JSON, do a calibration pass:
-   - Most rows should remain neutral-top.
-   - Many neutral-looking but plausible targets should still have `p_neutral >= 0.75`.
-   - Do not assign `p_endorsing > 0.35` from vibe/domain fit alone.
-   - Do not assign `p_disendorsing > 0.08` without concrete negative evidence.
-   - If a probability feels like a guess, shrink it back toward `0.80 / 0.18 / 0.02`.
+1. Read `endorsement_prompt.md` and skim `endorsement_targets.json` so you know the shape of the task.
+2. Build a profile of @{focal_user} centered on **authorship-relevant** features:
+   - What do they originate vs amplify? Sample standalone tweets vs replies / RTs / quotes.
+   - Their recurring "I recommend / I avoid" patterns — categories, confidence level, phrasings.
+   - Their close associates and the things those associates are known for. When a target is in a specific neighbor's niche, that raises P(neighbor-authored).
+   - The vocabulary and tone distinctively theirs.
+3. For each target, ask in order:
+   a. Does this target appear by name or close alias in @{focal_user}'s archive as something they brought up evaluatively? → strong update toward focal-authored.
+   b. Is the target obviously in a specific neighbor's niche more than @{focal_user}'s? → weak update toward neighbor-authored.
+   c. Is this just "the kind of thing the tribe likes"? → no update — stay near base rate.
+   d. Is there explicit negative evidence for this target or its category? → raise `p_disendorsing_given_focal`.
+4. Emit a per-item triple with concrete, **item-specific** reasoning that names the actual signal used.
+
+## Calibration rules
+
+- Most items remain neutral-top — that matches the 80% base rate. Don't force endorsement-top calls unless real signal supports it.
+- When the archive shows clear, durable, repeated focal-user endorsement of the target by name, `p_endorsing` can go up to ~0.65 (i.e. `p_focal_authored ≈ 0.7`). Higher requires unambiguous evidence.
+- When the archive shows clear focal-user disendorsement of the target or a tightly-related category, `p_disendorsing` can go up to ~0.5.
+- High topic-fit alone is **not** strong signal — many such items are neighbor-authored (this is exactly the failure mode the benchmark is built to expose). Cap `p_endorsing` at ~0.30 when you only have topic fit.
+- **No two reasoning sentences should be identical.** If you find yourself writing "no archive evidence; default base rate" for many items in a row, you have stopped doing the task — go back and apply the authorship checklist item-by-item.
 
 ## Output
 
 Write `predictions.json` in the workspace root with exactly this structure:
 
 ```json
-{
+{{
   "focal_user": "{focal_user}",
   "generated_at": "<ISO 8601 timestamp>",
   "predictions": [
-    {
+    {{
       "representative_tweet_id": 1803432686528213472,
       "target_entity": "Hank Green video on media literacy",
-      "reasoning": "One sentence naming the evidence strength: exact archive evidence, close analogue, weak topic fit, or no evidence.",
+      "reasoning": "One sentence naming the AUTHORSHIP signal: archive-by-name match / specific-neighbor-niche / tribe-only fit / explicit negative evidence / etc.",
       "p_neutral": 0.80,
       "p_endorsing": 0.18,
       "p_disendorsing": 0.02
-    }
+    }}
   ]
-}
+}}
+```
+
+Rules:
+- Include every entry from `endorsement_targets.json`, in the same order.
+- Probabilities must sum to 1.0.
+- Reasoning is one sentence, no line breaks, focused on the *authorship* signal — not the user's general preference.
+- Do not expose long chain-of-thought; only the concise authorship-evidence summary.
+- Do not ask the user for validation. Carry the task to the end.
 """
 
 
@@ -348,6 +353,16 @@ async def main() -> None:
         default=None,
         help="Model to pass to the agent CLI (e.g. claude-sonnet-4, gpt-4o).",
     )
+    parser.add_argument(
+        "--model-suffix",
+        default="",
+        metavar="TEXT",
+        help=(
+            "Optional label for the output subfolder only (not passed to the agent). "
+            "If set, the run folder is <model>-<suffix>_<timestamp> instead of "
+            "<model>_<timestamp> (default: empty)."
+        ),
+    )
     args = parser.parse_args()
 
     # Validate users
@@ -355,10 +370,17 @@ async def main() -> None:
     if unknown:
         parser.error(f"Unknown user(s): {', '.join(sorted(unknown))}. Valid: {', '.join(ALL_USERS)}")
 
-    # Build a per-run output subfolder: <output_dir>/<model>_<timestamp>/
+    # Build a per-run output subfolder:
+    #   No suffix:  <output_dir>/<model>_<timestamp>/
+    #   With suffix: <output_dir>/<model>-<suffix>_<timestamp>/
     run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
     model_slug = (args.model or "default").replace("/", "-").replace(":", "-")
-    run_output_dir = args.output_dir / f"{model_slug}_{run_id}"
+    if (s := args.model_suffix.strip()):
+        suffix_safe = s.replace("/", "-").replace(":", "-")
+        run_folder = f"{model_slug}-{suffix_safe}_{run_id}"
+    else:
+        run_folder = f"{model_slug}_{run_id}"
+    run_output_dir = args.output_dir / run_folder
     run_output_dir.mkdir(parents=True, exist_ok=True)
 
     # Temp root for all workspaces this run
@@ -367,6 +389,8 @@ async def main() -> None:
     print(f"Output dir     : {run_output_dir}")
     print(f"Users          : {', '.join(args.users)}")
     print(f"Concurrency    : {args.concurrency}")
+    if args.model_suffix.strip():
+        print(f"Model suffix   : {args.model_suffix.strip()!r}")
     print()
 
     semaphore = asyncio.Semaphore(args.concurrency)
