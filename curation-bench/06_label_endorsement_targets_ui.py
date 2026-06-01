@@ -34,11 +34,12 @@ skill vs marginal baseline, **weighted AUROC** (one-vs-rest average weighted
 by GT class frequency; same family as the ROC figures), weighted and macro F1,
 per-class F1, multiclass Brier,
 marginal baseline Brier, one-vs-rest **ROC** curves (human + models),
-one-vs-rest **FDR–recall** curves (false-discovery rate vs recall, also human +
-models, with each curve scored on **only** the rows that model can predict — i.e.
+a single **precision-at-20%-endorsing-prior vs recall** curve
+(``R = (TPR · 20) / (TPR · 20 + FPR · 80)`` — endorsing vs rest only, human +
+models, each curve scored on **only** the rows that predictor can score — i.e.
 its own support — and the support shown in each legend entry), and confusion
 matrices (vs `clean_labels` GT). Human probability metrics (Brier / skill / ROC /
-FDR–recall) use **only** soft probabilities (**prob_endorse** / **prob_disendorse** /
+prior-precision) use **only** soft probabilities (**prob_endorse** / **prob_disendorse** /
 **prob_neutral**) from ``predictions_top5_jul2024_human_probs.json``; rows without
 that triple are excluded from the human track (no one-hot fallback).
 
@@ -93,10 +94,8 @@ import streamlit as st
 from sklearn.metrics import (
     accuracy_score,
     auc,
-    average_precision_score,
     confusion_matrix,
     f1_score,
-    precision_recall_curve,
     roc_auc_score,
     roc_curve,
 )
@@ -266,6 +265,141 @@ def _unique_abbrev_labels_for_runs(prediction_runs: list[str]) -> list[str]:
             index_in_base[a] = index_in_base.get(a, 0) + 1
             out.append(f"{a}-{index_in_base[a]}")
     return out
+
+
+# Snapshot of `agent --model` registry as of 2026-05-11; used to split a run-folder name
+# into (base model, prompt/calib variant suffix). Refresh from `agent --model` if a new
+# model isn't recognised — unrecognised folders fall back to "model = whole name,
+# variant = (none)" so the chart still renders, they just won't share a color with peers.
+_KNOWN_AGENT_MODEL_NAMES: frozenset[str] = frozenset({
+    "auto",
+    "composer-2-fast", "composer-2",
+    "gpt-5.3-codex-low", "gpt-5.3-codex-low-fast",
+    "gpt-5.3-codex", "gpt-5.3-codex-fast",
+    "gpt-5.3-codex-high", "gpt-5.3-codex-high-fast",
+    "gpt-5.3-codex-xhigh", "gpt-5.3-codex-xhigh-fast",
+    "gpt-5.2",
+    "gpt-5.3-codex-spark-preview-low",
+    "gpt-5.3-codex-spark-preview",
+    "gpt-5.3-codex-spark-preview-high",
+    "gpt-5.3-codex-spark-preview-xhigh",
+    "gpt-5.2-codex-low", "gpt-5.2-codex-low-fast",
+    "gpt-5.2-codex", "gpt-5.2-codex-fast",
+    "gpt-5.2-codex-high", "gpt-5.2-codex-high-fast",
+    "gpt-5.2-codex-xhigh", "gpt-5.2-codex-xhigh-fast",
+    "gpt-5.1-codex-max-low", "gpt-5.1-codex-max-low-fast",
+    "gpt-5.1-codex-max-medium", "gpt-5.1-codex-max-medium-fast",
+    "gpt-5.1-codex-max-high", "gpt-5.1-codex-max-high-fast",
+    "gpt-5.1-codex-max-xhigh", "gpt-5.1-codex-max-xhigh-fast",
+    "gpt-5.5-high", "gpt-5.5-high-fast",
+    "claude-opus-4-7-thinking-high",
+    "gpt-5.4-high", "gpt-5.4-high-fast",
+    "claude-4.6-opus-high-thinking", "claude-4.6-opus-high-thinking-fast",
+    "gpt-5.5-none", "gpt-5.5-none-fast",
+    "gpt-5.5-low", "gpt-5.5-low-fast",
+    "gpt-5.5-medium", "gpt-5.5-medium-fast",
+    "gpt-5.5-extra-high", "gpt-5.5-extra-high-fast",
+    "claude-4.6-sonnet-medium", "claude-4.6-sonnet-medium-thinking",
+    "claude-opus-4-7-low", "claude-opus-4-7-medium",
+    "claude-opus-4-7-high", "claude-opus-4-7-xhigh", "claude-opus-4-7-max",
+    "claude-opus-4-7-thinking-low", "claude-opus-4-7-thinking-medium",
+    "claude-opus-4-7-thinking-xhigh", "claude-opus-4-7-thinking-max",
+    "grok-4.3",
+    "gpt-5.4-low", "gpt-5.4-medium", "gpt-5.4-medium-fast",
+    "gpt-5.4-xhigh", "gpt-5.4-xhigh-fast",
+    "claude-4.6-opus-high", "claude-4.6-opus-max",
+    "claude-4.6-opus-max-thinking", "claude-4.6-opus-max-thinking-fast",
+    "claude-4.5-opus-high", "claude-4.5-opus-high-thinking",
+    "gpt-5.2-low", "gpt-5.2-low-fast", "gpt-5.2-fast",
+    "gpt-5.2-high", "gpt-5.2-high-fast",
+    "gpt-5.2-xhigh", "gpt-5.2-xhigh-fast",
+    "gemini-3.1-pro",
+    "gpt-5.4-mini-none", "gpt-5.4-mini-low", "gpt-5.4-mini-medium",
+    "gpt-5.4-mini-high", "gpt-5.4-mini-xhigh",
+    "gpt-5.4-nano-none", "gpt-5.4-nano-low", "gpt-5.4-nano-medium",
+    "gpt-5.4-nano-high", "gpt-5.4-nano-xhigh",
+    "claude-4.5-sonnet", "claude-4.5-sonnet-thinking",
+    "gpt-5.1-low", "gpt-5.1", "gpt-5.1-high",
+    "gemini-3-flash",
+    "gpt-5.1-codex-mini-low", "gpt-5.1-codex-mini", "gpt-5.1-codex-mini-high",
+    "claude-4-sonnet", "claude-4-sonnet-thinking",
+    "gpt-5-mini",
+    "kimi-k2.5",
+})
+
+
+def _split_run_into_model_and_variant(run: str) -> tuple[str, str]:
+    """Return ``(model_family, variant_suffix)`` for a run folder name.
+
+    Strips the trailing ``_YYYYMMDDTHHMMSS`` timestamp, then finds the longest
+    hyphen-token prefix that exists in ``_KNOWN_AGENT_MODEL_NAMES``. Everything
+    before that boundary is the model; everything after is the variant suffix
+    (e.g. ``calib-prompt``, ``calib-v2``, or ``""`` for a base run).
+
+    If no prefix matches the registry, returns ``(abbrev_name, "")`` so the
+    caller still gets a usable family key — the run will just sit alone in its
+    own color slot.
+    """
+    base = _RUN_FOLDER_TS_SUFFIX.sub("", run).strip()
+    if not base:
+        return run, ""
+    tokens = base.split("-")
+    for k in range(len(tokens), 0, -1):
+        prefix = "-".join(tokens[:k])
+        if prefix in _KNOWN_AGENT_MODEL_NAMES:
+            return prefix, "-".join(tokens[k:])
+    return base, ""
+
+
+# Cycle of distinguishable line styles for variants within one model family.
+# Beyond 8 variants the cycle repeats; same-color same-style collisions only happen
+# at 9+ variants per model — log that off to the user via a Streamlit caption if it
+# ever happens (see render functions). Tuples are matplotlib dash patterns.
+_VARIANT_LINE_STYLES: tuple[Any, ...] = (
+    "-",                       # solid
+    "--",                      # dashed
+    ":",                       # dotted
+    "-.",                      # dashdot
+    (0, (5, 1)),               # densely dashed
+    (0, (1, 1)),               # densely dotted
+    (0, (3, 1, 1, 1)),         # densely dashdotted
+    (0, (3, 5, 1, 5)),         # dashdotted (loose)
+)
+
+
+def _assign_run_styles(
+    prediction_runs: list[str],
+) -> tuple[dict[str, tuple[Any, Any]], list[tuple[str, list[str]]]]:
+    """Map each run to ``(color, linestyle)``; same model family ⇒ same color.
+
+    Returns ``(style_map, families)`` where ``families`` is the ordered list of
+    ``(model_family, [run_names sorted by variant])`` so callers can write a
+    short legend hint. Color cycles ``tab10`` in family-first-appearance order;
+    line style cycles ``_VARIANT_LINE_STYLES`` per variant within a family.
+    """
+    cmap = plt.get_cmap("tab10")
+    runs_by_family: dict[str, list[str]] = {}
+    family_order: list[str] = []
+    for run in prediction_runs:
+        family, _variant = _split_run_into_model_and_variant(run)
+        if family not in runs_by_family:
+            runs_by_family[family] = []
+            family_order.append(family)
+        runs_by_family[family].append(run)
+
+    style_map: dict[str, tuple[Any, Any]] = {}
+    families_ordered: list[tuple[str, list[str]]] = []
+    for color_idx, family in enumerate(family_order):
+        color = cmap(color_idx % 10)
+        runs_in_family = sorted(
+            runs_by_family[family],
+            key=lambda r: _split_run_into_model_and_variant(r)[1],
+        )
+        for variant_idx, run in enumerate(runs_in_family):
+            ls = _VARIANT_LINE_STYLES[variant_idx % len(_VARIANT_LINE_STYLES)]
+            style_map[run] = (color, ls)
+        families_ordered.append((family, runs_in_family))
+    return style_map, families_ordered
 
 
 def _truncate_display(s: str, max_len: int = 64) -> str:
@@ -852,6 +986,18 @@ def render_roc_ovr_curves_for_runs(
         st.caption(
             f"Note: human soft-prob file not found at `{hp_path}`; Human ROC track is omitted."
         )
+    style_map, families = _assign_run_styles(prediction_runs)
+    if any(len(runs) > 1 for _f, runs in families):
+        st.caption(
+            "**Color = base model family; line style = prompt/calibration variant.** "
+            "Same-color curves are the same model with different prompt or "
+            "calibration tweaks. Human is dotted black."
+        )
+    if any(len(runs) > len(_VARIANT_LINE_STYLES) for _f, runs in families):
+        st.caption(
+            f"⚠ Some model families have more than {len(_VARIANT_LINE_STYLES)} variants — "
+            "line styles will repeat within those families."
+        )
     with plt.rc_context(
         {
             "figure.dpi": ROC_OVR_FIGURE_DPI,
@@ -865,7 +1011,6 @@ def render_roc_ovr_curves_for_runs(
             dpi=ROC_OVR_FIGURE_DPI,
             layout="constrained",
         )
-        cmap = plt.get_cmap("tab10")
         plotted_ovr = [False, False, False]
         if built_human is not None:
             y_true_h, P_h = built_human
@@ -891,7 +1036,7 @@ def render_roc_ovr_curves_for_runs(
                 )
                 plotted_ovr[ci] = True
         for run_idx, run in enumerate(prediction_runs):
-            color = cmap(run_idx % 10)
+            color, linestyle = style_map[run]
             built = _agent_y_true_and_prob_matrix_for_run(
                 rows, focals, predictions_root, run
             )
@@ -913,6 +1058,7 @@ def render_roc_ovr_curves_for_runs(
                     fpr,
                     tpr,
                     color=color,
+                    linestyle=linestyle,
                     lw=ROC_OVR_LINEWIDTH,
                     zorder=1,
                     label=f"{run_display_labels[run_idx]} ({roc_auc:.3f})",
@@ -962,7 +1108,15 @@ def render_roc_ovr_curves_for_runs(
         plt.close(fig)
 
 
-def render_fdr_recall_curves_for_runs(
+# Single-panel "precision @ 20% endorsing prior" figure: square axes box, legend on the right.
+PRIOR_CURVE_FIGSIZE_W_IN: float = 6.5
+PRIOR_CURVE_FIGSIZE_H_IN: float = 4.6
+# Endorsing-prior re-weighting; if you change these, also update the caption / axis label.
+ENDORSING_PRIOR_POS: float = 20.0
+ENDORSING_PRIOR_NEG: float = 80.0
+
+
+def render_precision_at_endorsing_prior_curve(
     *,
     rows: list[tuple[str, int, str, str]],
     focals: list[str],
@@ -971,16 +1125,21 @@ def render_fdr_recall_curves_for_runs(
     run_display_labels: list[str],
     human_probs_path: Path,
 ) -> None:
-    """One figure: 3 stacked OvR panels of False Discovery Rate (FDR) vs Recall.
+    """Single panel: precision under a fixed 20% endorsing prior, plotted vs recall.
 
-    Mirrors :func:`render_roc_ovr_curves_for_runs` but plots
-    ``FDR = FP / (TP + FP) = 1 − precision`` against ``Recall = TP / (TP + FN)``.
+    Binary task: ``endorsing vs rest``. For each predictor we sweep the threshold
+    on its endorsing-probability score (Human: ``prob_endorse``; agents:
+    ``p_endorsing``) and at every operating point compute ``(TPR, FPR)``. Those
+    are then re-weighted to a fixed positive prevalence of 20% (negatives 80%):
 
-    Each curve is scored on the rows where that predictor has a probability
-    (per-model support); the legend includes ``n=…`` so the support is visible.
-    The dashed horizontal baseline per panel is the random-classifier FDR
-    (= 1 − class prevalence) computed from the pooled evaluation rows; per-model
-    prevalence may differ slightly because of differing supports.
+        R = (TPR * 20) / (TPR * 20 + FPR * 80)
+
+    ``R`` is the **precision (positive predictive value)** the predictor would
+    attain if endorsing items appeared at a 20% base rate in deployment —
+    independent of the empirical prevalence on this evaluation slice (which lets
+    curves with different supports share the same axes). A random scorer has
+    ``TPR == FPR`` at every threshold so ``R`` collapses to ``20 / 100 = 0.20``;
+    that's the dashed baseline.
     """
     if len(run_display_labels) != len(prediction_runs):
         run_display_labels = _unique_abbrev_labels_for_runs(prediction_runs)
@@ -994,160 +1153,187 @@ def render_fdr_recall_curves_for_runs(
     if not prediction_runs and built_human is None:
         return
 
-    pooled_gt_classes = [g for _f, _t, _tg, g in rows]
-    pooled_n = len(pooled_gt_classes)
-    pooled_prevalence: dict[str, float] = {
-        cname: (pooled_gt_classes.count(cname) / pooled_n if pooled_n else 0.0)
-        for cname in GT_CLASSES
-    }
+    pos_class = "endorsing"
+    pos_idx = GT_CLASSES.index(pos_class)
+    pi_pos = ENDORSING_PRIOR_POS
+    pi_neg = ENDORSING_PRIOR_NEG
+    baseline_R = pi_pos / (pi_pos + pi_neg)
 
-    st.markdown("##### False discovery rate vs recall (one-vs-rest, probability scores)")
+    st.markdown(
+        "##### Precision at 20% endorsing prior vs recall "
+        "(endorsing vs rest, probability scores)"
+    )
     st.caption(
-        f"Native canvas ≈ **{ROC_OVR_FIGSIZE_W_IN:.1f} × {ROC_OVR_FIGSIZE_H_IN:.1f}** inches at "
-        f"**{ROC_OVR_FIGURE_DPI:.0f} dpi** → **~"
-        f"{int(ROC_OVR_FIGSIZE_W_IN * ROC_OVR_FIGURE_DPI)} × {int(ROC_OVR_FIGSIZE_H_IN * ROC_OVR_FIGURE_DPI)}** px. "
-        "Each panel is binary “this class vs rest” using **predicted probability for that class**. "
-        "**Recall (x)** = TP / (TP + FN) — fraction of true positives caught. "
-        "**FDR (y)** = FP / (TP + FP) = 1 − precision — fraction of flagged items that are wrong. "
-        "Each curve is computed on **only the rows where that predictor has a probability** "
-        "(its own support; shown as `n=…` in the legend). "
-        "**AP** in the legend = average-precision (PR-AUC). "
-        "Dashed horizontal line per panel = random-classifier FDR baseline = 1 − pooled class prevalence; "
-        "per-model prevalence may differ slightly when supports differ."
+        "Binary task: **endorsing vs rest**, scored on each predictor's "
+        "**p_endorsing** (Human uses **prob_endorse** from "
+        "`predictions_top5_jul2024_human_probs.json`). "
+        "**Recall (x)** = TPR = TP / (TP + FN) — fraction of endorsing items caught. "
+        "**R (y)** = (TPR · 20) / (TPR · 20 + FPR · 80) — the precision the "
+        "predictor would have if endorsing items appeared at a fixed **20% base "
+        "rate** in the population (re-weighting positives to 20% and negatives "
+        "to 80% regardless of the empirical prevalence on this slice). "
+        "**How to read it:** *if I deploy this predictor on a stream where ~20% "
+        "of items are endorsing, what fraction of the items it flags will "
+        "actually be endorsing as I dial recall up?* Higher = better; the "
+        "left edge (low recall) shows precision when the predictor is most "
+        "selective, the right edge (recall = 1) shows precision once it accepts "
+        "everything. Each curve is computed on **only the rows where that "
+        "predictor has a score** (its own support; `n=…` in the legend). "
+        f"Dashed horizontal line = random-classifier baseline R = {baseline_R:.2f} "
+        "(since TPR = FPR at every threshold for a random scorer)."
     )
     if not hp_path.is_file():
         st.caption(
-            f"Note: human soft-prob file not found at `{hp_path}`; Human FDR–recall track is omitted."
+            f"Note: human soft-prob file not found at `{hp_path}`; Human curve omitted."
         )
+    style_map, families = _assign_run_styles(prediction_runs)
+    if any(len(runs) > 1 for _f, runs in families):
+        st.caption(
+            "**Color = base model family; line style = prompt/calibration variant.** "
+            "Same-color curves are the same model with different prompt or "
+            "calibration tweaks. Human is dotted black."
+        )
+    if any(len(runs) > len(_VARIANT_LINE_STYLES) for _f, runs in families):
+        st.caption(
+            f"⚠ Some model families have more than {len(_VARIANT_LINE_STYLES)} variants — "
+            "line styles will repeat within those families."
+        )
+
+    def _compute_R_curve(
+        y_true_classes: list[str], P: np.ndarray
+    ) -> tuple[np.ndarray, np.ndarray] | None:
+        """(tpr, R) sweeping the endorsing-score threshold; ``None`` if degenerate."""
+        y_bin = np.asarray(
+            [1 if yt == pos_class else 0 for yt in y_true_classes], dtype=np.int32
+        )
+        n_pos = int(np.sum(y_bin))
+        if n_pos == 0 or n_pos == len(y_bin):
+            return None
+        scores = P[:, pos_idx]
+        try:
+            fpr, tpr, _ = roc_curve(y_bin, scores)
+        except ValueError:
+            return None
+        denom = tpr * pi_pos + fpr * pi_neg
+        # R undefined when no items are flagged positive (TPR = FPR = 0); leave as NaN
+        # so matplotlib doesn't draw a misleading point at the origin.
+        R = np.where(denom > 0, (tpr * pi_pos) / np.maximum(denom, 1e-12), np.nan)
+        return tpr, R
+
     with plt.rc_context(
         {
             "figure.dpi": ROC_OVR_FIGURE_DPI,
             "savefig.dpi": ROC_OVR_FIGURE_DPI,
         },
     ):
-        fig, axes = plt.subplots(
-            3,
+        fig, ax = plt.subplots(
             1,
-            figsize=(ROC_OVR_FIGSIZE_W_IN, ROC_OVR_FIGSIZE_H_IN),
+            1,
+            figsize=(PRIOR_CURVE_FIGSIZE_W_IN, PRIOR_CURVE_FIGSIZE_H_IN),
             dpi=ROC_OVR_FIGURE_DPI,
             layout="constrained",
         )
-        cmap = plt.get_cmap("tab10")
-        plotted_ovr = [False, False, False]
+        plotted_any = False
 
         if built_human is not None:
             y_true_h, P_h = built_human
-            n_h = len(y_true_h)
-            for ci, cname in enumerate(GT_CLASSES):
-                ax = axes[ci]
-                y_bin = np.array(
-                    [1 if yt == cname else 0 for yt in y_true_h], dtype=np.int32
-                )
-                pos = int(np.sum(y_bin))
-                if pos == 0 or pos == len(y_bin):
-                    continue
-                scores = P_h[:, ci]
-                try:
-                    precision, recall, _ = precision_recall_curve(y_bin, scores)
-                    ap = average_precision_score(y_bin, scores)
-                except ValueError:
-                    continue
-                fdr = 1.0 - precision
+            curve = _compute_R_curve(y_true_h, P_h)
+            if curve is not None:
+                tpr_h, R_h = curve
                 ax.plot(
-                    recall,
-                    fdr,
+                    tpr_h,
+                    R_h,
                     color="black",
                     lw=ROC_OVR_LINEWIDTH,
                     ls=":",
                     zorder=10,
-                    label=f"Human (AP={ap:.3f}, n={n_h})",
+                    label=f"Human (n={len(y_true_h)})",
                 )
-                plotted_ovr[ci] = True
+                plotted_any = True
 
         for run_idx, run in enumerate(prediction_runs):
-            color = cmap(run_idx % 10)
+            color, linestyle = style_map[run]
             built = _agent_y_true_and_prob_matrix_for_run(
                 rows, focals, predictions_root, run
             )
             if built is None:
                 continue
             y_true, P = built
-            n_run = len(y_true)
-            for ci, cname in enumerate(GT_CLASSES):
-                ax = axes[ci]
-                y_bin = np.array(
-                    [1 if yt == cname else 0 for yt in y_true], dtype=np.int32
-                )
-                pos = int(np.sum(y_bin))
-                if pos == 0 or pos == len(y_bin):
-                    continue
-                scores = P[:, ci]
-                try:
-                    precision, recall, _ = precision_recall_curve(y_bin, scores)
-                    ap = average_precision_score(y_bin, scores)
-                except ValueError:
-                    continue
-                fdr = 1.0 - precision
-                ax.plot(
-                    recall,
-                    fdr,
-                    color=color,
-                    lw=ROC_OVR_LINEWIDTH,
-                    zorder=1,
-                    label=f"{run_display_labels[run_idx]} (AP={ap:.3f}, n={n_run})",
-                )
-                plotted_ovr[ci] = True
+            curve = _compute_R_curve(y_true, P)
+            if curve is None:
+                continue
+            tpr_r, R_r = curve
+            ax.plot(
+                tpr_r,
+                R_r,
+                color=color,
+                linestyle=linestyle,
+                lw=ROC_OVR_LINEWIDTH,
+                zorder=1,
+                label=f"{run_display_labels[run_idx]} (n={len(y_true)})",
+            )
+            plotted_any = True
 
-        for ci, cname in enumerate(GT_CLASSES):
-            ax = axes[ci]
-            baseline_fdr = 1.0 - pooled_prevalence[cname]
-            ax.axhline(
-                baseline_fdr,
-                color="0.4",
-                lw=ROC_OVR_DIAG_LINEWIDTH,
-                ls="--",
-                alpha=0.6,
+        ax.axhline(
+            baseline_R,
+            color="0.4",
+            lw=ROC_OVR_DIAG_LINEWIDTH,
+            ls="--",
+            alpha=0.6,
+        )
+        ax.set_xlim(-0.02, 1.02)
+        ax.set_ylim(-0.02, 1.02)
+        ax.set_xticks(np.arange(0.0, 1.01, 0.1))
+        ax.set_yticks(np.arange(0.0, 1.01, 0.1))
+        ax.set_xticks(np.arange(0.0, 1.01, 0.05), minor=True)
+        ax.set_yticks(np.arange(0.0, 1.01, 0.05), minor=True)
+        ax.set_xlabel("Recall (TPR)", fontsize=ROC_OVR_AXIS_LABEL_FONTSIZE)
+        ax.set_ylabel(
+            "R = precision @ 20% endorsing prior",
+            fontsize=ROC_OVR_AXIS_LABEL_FONTSIZE,
+        )
+        ax.set_title(
+            f'Endorsing vs rest (random baseline R={baseline_R:.2f})',
+            fontsize=ROC_OVR_TITLE_FONTSIZE,
+        )
+        ax.tick_params(axis="both", labelsize=ROC_OVR_TICK_FONTSIZE)
+        ax.set_axisbelow(True)
+        ax.grid(
+            True,
+            which="major",
+            linestyle="-",
+            linewidth=0.6,
+            color="0.55",
+            alpha=0.7,
+        )
+        ax.grid(
+            True,
+            which="minor",
+            linestyle=":",
+            linewidth=0.4,
+            color="0.75",
+            alpha=0.5,
+        )
+        if plotted_any:
+            ax.legend(
+                fontsize=ROC_OVR_LEGEND_FONTSIZE,
+                loc="lower left",
+                bbox_to_anchor=(1.015, 0),
+                frameon=False,
+                handlelength=1.6,
+                borderaxespad=0.0,
             )
-            ax.set_xlim(-0.02, 1.02)
-            ax.set_ylim(-0.02, 1.02)
-            ax.set_xticks(np.arange(0.0, 1.01, 0.1))
-            ax.set_yticks(np.arange(0.0, 1.01, 0.1))
-            ax.set_xlabel("Recall (TPR)", fontsize=ROC_OVR_AXIS_LABEL_FONTSIZE)
-            ax.set_ylabel("False discovery rate", fontsize=ROC_OVR_AXIS_LABEL_FONTSIZE)
-            ax.set_title(
-                f'GT class: "{cname}" vs rest (baseline FDR={baseline_fdr:.2f})',
-                fontsize=ROC_OVR_TITLE_FONTSIZE,
+        else:
+            ax.text(
+                0.5,
+                0.5,
+                "No valid endorsing-vs-rest curve\n(both classes needed)",
+                ha="center",
+                va="center",
+                fontsize=ROC_OVR_AXIS_LABEL_FONTSIZE,
+                color="0.35",
             )
-            ax.tick_params(axis="both", labelsize=ROC_OVR_TICK_FONTSIZE)
-            ax.set_axisbelow(True)
-            ax.grid(
-                True,
-                which="major",
-                linestyle=ROC_OVR_GRID_LINESTYLE,
-                linewidth=ROC_OVR_GRID_LINEWIDTH,
-                color=ROC_OVR_GRID_COLOR,
-                alpha=ROC_OVR_GRID_ALPHA,
-            )
-            if plotted_ovr[ci]:
-                ax.legend(
-                    fontsize=ROC_OVR_LEGEND_FONTSIZE,
-                    loc="lower left",
-                    bbox_to_anchor=(1.015, 0),
-                    frameon=False,
-                    handlelength=1.6,
-                    borderaxespad=0.0,
-                )
-            else:
-                ax.text(
-                    0.5,
-                    0.5,
-                    "No valid OvR PR\n(both classes needed)",
-                    ha="center",
-                    va="center",
-                    fontsize=ROC_OVR_AXIS_LABEL_FONTSIZE,
-                    color="0.35",
-                )
-            ax.set_aspect("equal", adjustable="box")
+        ax.set_aspect("equal", adjustable="box")
         st.pyplot(fig, use_container_width=False)
         plt.close(fig)
 
@@ -1493,7 +1679,7 @@ def render_review_performance(
             run_display_labels=active_run_display_labels,
             human_probs_path=human_probs_path,
         )
-        render_fdr_recall_curves_for_runs(
+        render_precision_at_endorsing_prior_curve(
             rows=rows,
             focals=list(focals),
             predictions_root=predictions_root,
@@ -2251,8 +2437,9 @@ def main() -> None:
     if review_mode:
         st.info(
             "**Review mode:** **Aggregate metrics** (default tab) has accuracy / Brier skill / "
-            "weighted AUROC / F1 / Brier vs marginal baseline / one-vs-rest **ROC** + "
-            "**FDR–recall** curves (each scored on that model's own support); "
+            "weighted AUROC / F1 / Brier vs marginal baseline / one-vs-rest **ROC** curves "
+            "+ a **precision-at-20%-endorsing-prior vs recall** curve "
+            "(each scored on that model's own support); "
             "**Browse items** shows the compact **GT / Human / models** table "
             f"({EMOJI_ENDORSING} endorsing · {EMOJI_NEUTRAL} neutral · "
             f"{EMOJI_DISENDORING} disendorsing; {EMOJI_HUMAN_WRONG_TARGET} human wrong "

@@ -418,6 +418,8 @@ def main() -> None:
         llm_concurrency=args.concurrency,
         path_concurrency=args.path_concurrency,
         paths_only=args.paths_only,
+        window_start=args.start,
+        window_end=args.end,
     )
 
 

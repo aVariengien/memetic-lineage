@@ -556,13 +556,56 @@ def _path_ids_for_tweet(tweet_id: int, tweet: dict[str, Any], conversation_trees
     return path_from_root(tweet_id, tree)
 
 
+def _truncate_path_to_window(
+    path_ids: list[int],
+    tweet_dict: Any,
+    window_start: str,
+    window_end: str,
+) -> list[int]:
+    """Keep only the contiguous in-window suffix of ``path_ids`` ending at the leaf.
+
+    ``path_ids`` is ordered root -> leaf. The leaf is the candidate (anchor)
+    tweet, which is guaranteed to be in window by upstream selection. Reply
+    timestamps are monotonic root -> leaf, so the path is structurally
+    ``[ ..pre-window.. ] [ ..in-window.. ]`` with a single transition. We walk
+    from the leaf backwards and stop at the first ancestor that is either
+    pre-window or missing from ``tweet_dict`` (we cannot prove it is in window
+    in that case; conservative).
+
+    Returns the truncated list. The leaf is preserved iff it is in window.
+    """
+    cutoff = len(path_ids)
+    for index in range(len(path_ids) - 1, -1, -1):
+        ancestor_id = path_ids[index]
+        ancestor = tweet_dict.get(ancestor_id) or tweet_dict.get(str(ancestor_id))
+        ancestor_ts = created_at_str(ancestor) if ancestor else ""
+        if ancestor_ts and window_start <= ancestor_ts < window_end:
+            cutoff = index
+        else:
+            break
+    return path_ids[cutoff:]
+
+
 def collapse_to_maximal_unique_paths(
     candidates: list[dict[str, Any]],
     tweet_dict: Any,
     conversation_trees: Any,
+    *,
+    window_start: str | None = None,
+    window_end: str | None = None,
 ) -> list[dict[str, Any]]:
+    """Collapse candidates to unique maximal reply paths.
+
+    If ``window_start`` and ``window_end`` are both provided, every ancestor
+    that is pre-window (``created_at < window_start``) or missing from
+    ``tweet_dict`` is dropped from each path before deduplication. This
+    prevents pre-window content from ever reaching the rendered ``path_text``,
+    the LLM prompt, or the validation set, which is the root-cause fix for
+    the data leak documented in DATA_LEAK_DIAGNOSTIC.md.
+    """
     unique_by_path: dict[tuple[int, ...], dict[str, Any]] = {}
     strict_prefixes: set[tuple[int, ...]] = set()
+    apply_window = window_start is not None and window_end is not None
 
     for item in candidates:
         tweet_id = int(item["tweet_id"])
@@ -571,6 +614,12 @@ def collapse_to_maximal_unique_paths(
             continue
 
         path_ids = _path_ids_for_tweet(tweet_id, tweet, conversation_trees)
+        if apply_window:
+            path_ids = _truncate_path_to_window(
+                path_ids, tweet_dict, window_start, window_end  # type: ignore[arg-type]
+            )
+            if not path_ids:
+                continue
         path_key = tuple(path_ids)
         if path_key in unique_by_path:
             continue

@@ -207,6 +207,8 @@ def run_endorsement_pipeline(
     llm_concurrency: int = 50,
     path_concurrency: int = 50,
     paths_only: bool = False,
+    window_start: str | None = None,
+    window_end: str | None = None,
 ) -> PipelineResult:
     """Run the full extraction pipeline.
 
@@ -226,6 +228,13 @@ def run_endorsement_pipeline(
         model: LLM model id.
         batch_size, llm_concurrency, path_concurrency: knobs.
         paths_only: If true, stop after writing the paths JSON.
+        window_start, window_end: Inclusive / exclusive prediction-window
+            bounds. When both are provided, ancestors that fall outside
+            ``[window_start, window_end)`` (or that are missing from
+            ``tweet_dict``) are stripped from every reply path before
+            rendering. This guarantees ``path_text``, the LLM prompt, and
+            ``representative_tweet_id`` validation only see in-window tweets.
+            Set both to ``None`` to disable (legacy behaviour).
 
     Returns:
         ``PipelineResult`` with paths, counts, and the failed batches log.
@@ -235,6 +244,11 @@ def run_endorsement_pipeline(
     paths_stats_extras = dict(paths_stats_extras or {})
     targets_stats_extras = dict(targets_stats_extras or {})
 
+    if (window_start is None) != (window_end is None):
+        raise ValueError(
+            "window_start and window_end must both be provided or both be None"
+        )
+
     if not candidates:
         raise ValueError("run_endorsement_pipeline received an empty candidate list")
 
@@ -242,8 +256,17 @@ def run_endorsement_pipeline(
         candidates, key=lambda item: (item["created_at"], item["tweet_id"])
     )
     unique_paths = collapse_to_maximal_unique_paths(
-        ordered_candidates, tweet_dict, conversation_trees
+        ordered_candidates,
+        tweet_dict,
+        conversation_trees,
+        window_start=window_start,
+        window_end=window_end,
     )
+    if window_start is not None and window_end is not None:
+        print(
+            f"Window-truncated reply paths to [{window_start}, {window_end}); "
+            f"every ancestor strictly before {window_start} or missing from tweet_dict was dropped."
+        )
     print(f"Unique maximal reply paths: {len(unique_paths):,}")
     if not unique_paths:
         raise ValueError("No unique maximal paths could be built from the candidates")
@@ -260,6 +283,11 @@ def run_endorsement_pipeline(
         "candidate_tweet_count": len(ordered_candidates),
         "unique_path_count": len(unique_paths),
         "rendered_path_count": len(sampled_items),
+        "path_window_truncation": {
+            "applied": window_start is not None and window_end is not None,
+            "window_start_inclusive": window_start,
+            "window_end_exclusive": window_end,
+        },
         **paths_stats_extras,
     }
     paths_payload = {
@@ -309,6 +337,11 @@ def run_endorsement_pipeline(
         "concurrency": llm_concurrency,
         "failed_batches": failed_batches,
         "targets_per_anchor_username": dict(targets_per_anchor),
+        "path_window_truncation": {
+            "applied": window_start is not None and window_end is not None,
+            "window_start_inclusive": window_start,
+            "window_end_exclusive": window_end,
+        },
         **targets_stats_extras,
     }
     targets_payload = {
