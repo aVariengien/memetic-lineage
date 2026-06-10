@@ -26,6 +26,7 @@ scratchpads/data/example_strands
 scratchpads/data/*_old
 cluster_reports.zip
 cluster_volume_evolution.png
+curation-bench/data/
 
 # Tooling artifacts
 .claude/

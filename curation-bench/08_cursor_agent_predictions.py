@@ -11,6 +11,9 @@ Each agent gets a clean isolated workspace containing:
   - A stripped version of the ground truth JSON (no labels/context/direction)
   - The endorsement prompt definition
 
+The prediction strategy prompt is either read from ``--prompt-file`` (markdown
+with ``{focal_user}`` and ``{n_items}`` placeholders) or the built-in default.
+
 Output predictions are written to data/labels/cursor_agent_predictions/.
 """
 
@@ -79,6 +82,17 @@ def strip_ground_truth(data: dict) -> dict:
         for item in data.get("items", [])
     ]
     return stripped
+
+
+def render_prompt(template: str, focal_user: str, n_items: int) -> str:
+    """Fill a prompt template with per-user values.
+
+    Targeted replacement (not ``str.format``) so literal JSON braces in the
+    template's output-schema block are left untouched.
+    """
+    return template.replace("{focal_user}", focal_user).replace(
+        "{n_items}", str(n_items)
+    )
 
 
 def build_agent_prompt(focal_user: str, n_items: int) -> str:
@@ -219,6 +233,7 @@ async def run_agent(
     startup_lock: asyncio.Lock,
     progress: tqdm,
     model: str | None = None,
+    prompt_template: str | None = None,
 ) -> dict:
     """Set up workspace and run the Cursor agent for one user. Returns a result dict."""
     async with semaphore:
@@ -246,7 +261,10 @@ async def run_agent(
             shutil.copy(PROMPT_FILE, workspace / "endorsement_prompt.md")
 
             # ---- Build prompt -------------------------------------------
-            prompt = build_agent_prompt(username, n_items)
+            if prompt_template is not None:
+                prompt = render_prompt(prompt_template, username, n_items)
+            else:
+                prompt = build_agent_prompt(username, n_items)
 
             # ---- Run agent ----------------------------------------------
             cmd = [
@@ -363,12 +381,30 @@ async def main() -> None:
             "<model>_<timestamp> (default: empty)."
         ),
     )
+    parser.add_argument(
+        "--prompt-file",
+        type=Path,
+        default=None,
+        help=(
+            "Path to a prediction-strategy prompt template (markdown with "
+            "{focal_user} and {n_items} placeholders). If omitted, uses the "
+            "built-in default prompt."
+        ),
+    )
     args = parser.parse_args()
 
     # Validate users
     unknown = set(args.users) - set(ALL_USERS)
     if unknown:
         parser.error(f"Unknown user(s): {', '.join(sorted(unknown))}. Valid: {', '.join(ALL_USERS)}")
+
+    prompt_template: str | None = None
+    prompt_path: Path | None = None
+    if args.prompt_file is not None:
+        prompt_path = args.prompt_file.resolve()
+        if not prompt_path.is_file():
+            parser.error(f"Prompt file not found: {prompt_path}")
+        prompt_template = prompt_path.read_text(encoding="utf-8")
 
     # Build a per-run output subfolder:
     #   No suffix:  <output_dir>/<model>_<timestamp>/
@@ -383,10 +419,14 @@ async def main() -> None:
     run_output_dir = args.output_dir / run_folder
     run_output_dir.mkdir(parents=True, exist_ok=True)
 
+    if prompt_path is not None:
+        shutil.copy(prompt_path, run_output_dir / "prompt_used.md")
+
     # Temp root for all workspaces this run
     tmp_root = Path(tempfile.mkdtemp(prefix=f"cursor_endorse_{run_id}_"))
     print(f"Workspace root : {tmp_root}")
     print(f"Output dir     : {run_output_dir}")
+    print(f"Prompt         : {prompt_path or 'built-in default'}")
     print(f"Users          : {', '.join(args.users)}")
     print(f"Concurrency    : {args.concurrency}")
     if args.model_suffix.strip():
@@ -402,8 +442,16 @@ async def main() -> None:
             workspace = tmp_root / username
             workspace.mkdir()
             tasks.append(
-                run_agent(username, workspace, run_output_dir, semaphore, startup_lock,
-                          progress, model=args.model)
+                run_agent(
+                    username,
+                    workspace,
+                    run_output_dir,
+                    semaphore,
+                    startup_lock,
+                    progress,
+                    model=args.model,
+                    prompt_template=prompt_template,
+                )
             )
         results = await asyncio.gather(*tasks)
 
